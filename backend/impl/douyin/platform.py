@@ -9,6 +9,7 @@ Chromium) with automatic Playwright fallback.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import threading
 import time
@@ -777,6 +778,50 @@ class DouyinPlatform(BasePlatform):
             )
         return True, ""
 
+    @classmethod
+    def _collect_topics(
+        cls, desc: str, tags: list | None, activities: list | None
+    ) -> tuple[str, list[str]]:
+        """合并话题来源并清洗描述,返回 ``(清洗后的描述, 话题列表)``。
+
+        - 话题来源:``tags`` + 描述里的 ``#xxx`` + 官方活动,按出现顺序去重。
+        - 描述里的 ``#xxx`` 会被移除,之后统一由输入流程转成话题芯片,
+          避免以普通文字形式留在正文里。
+        - 抖音单条作品最多 5 个话题,超出只保留前 5 个并告警。
+        """
+        desc = desc or ""
+        max_topics = 5
+
+        def _normalize(raw) -> str:
+            return str(raw or "").strip().lstrip("#").strip()
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        def _add(raw) -> None:
+            name = _normalize(raw)
+            if name and name not in seen:
+                seen.add(name)
+                ordered.append(name)
+
+        for tag in tags or []:
+            _add(tag)
+        for matched in cls._HASHTAG_PATTERN.findall(desc):
+            _add(matched)
+        for activity in activities or []:
+            _add(activity)
+
+        cleaned = cls._HASHTAG_PATTERN.sub("", desc).strip()
+
+        if len(ordered) > max_topics:
+            logger.warning(
+                "[话题] 合并后共 %d 个,超过抖音上限 %d,只保留前 %d 个: %s",
+                len(ordered), max_topics, max_topics, ordered[:max_topics],
+            )
+            ordered = ordered[:max_topics]
+
+        return cleaned, ordered
+
     # ------------------------------------------------------------------
     # Helper: fill title, description, tags
     # ------------------------------------------------------------------
@@ -1124,7 +1169,8 @@ class DouyinPlatform(BasePlatform):
         - ``enableTimer`` (*bool*, optional)
         - ``schedule_time_str`` (*str*, optional)
         - ``ai_content`` (*str*, optional) -- AI content declaration
-        - ``activities`` (*list[str]*, optional) -- official activities (appended as #tags)
+        - ``activities`` (*list[str]*, optional) -- official activities (same as tags,
+          typed as topic chips together with ``tags`` and the ``#xxx`` in ``desc``)
         - ``dry_run`` (*bool*, optional) -- if True, skip publish button click (default True)
         """
         logger.info("=" * 60)
@@ -1178,10 +1224,9 @@ class DouyinPlatform(BasePlatform):
             logger.warning("[发布参数] 封面文件不存在: %s", cover_path)
             cover_path = ""
 
-        # Append activities as hashtags to description
-        if activities:
-            activity_tags = " ".join([f"#{act}" for act in activities])
-            desc = f"{desc} {activity_tags}".strip()
+        # 话题统一收集：标签 + 描述里的 #xxx + 官方活动 → 全部作为话题芯片输入
+        desc, tags = self._collect_topics(desc, tags, activities)
+        logger.info("[话题] 合并后共 %d 个: %s", len(tags), tags)
 
         for cookie_index, cookie_path in enumerate(account_paths):
             cookie_name = Path(cookie_path).name
@@ -1303,25 +1348,31 @@ class DouyinPlatform(BasePlatform):
                 await page.keyboard.type(title[:20])
                 await pause_after_input()
 
-                # 逐字输入描述，一次性注入标签
-                logger.info("[填写简介] 开始填写简介与标签...")
+                # 填写描述 + 话题（话题必须走真实 keydown，见 _type_hashtag）
+                logger.info("[填写简介] 开始填写简介与话题: %s", tags)
                 desc_editor = page.locator(
                     'div[data-zone-container="*"][contenteditable="true"]'
                 ).first
                 await desc_editor.wait_for(state="visible", timeout=10000)
                 await desc_editor.click()
-                await page.keyboard.press("Control+KeyA")
-                await page.keyboard.press("Delete")
-
-                await page.keyboard.type(desc[:1000])
+                await clear_and_type(page, desc[:1000])
                 await pause_after_input()
-                await asyncio.sleep(0.2)
 
-                for tag in tags:
-                    await page.keyboard.insert_text(" #" + tag)
+                if tags:
                     await page.keyboard.press("Space")
-                await pause_after_input()
-                await asyncio.sleep(0.3)
+                    cdp = await page.context.new_cdp_session(page)
+                    try:
+                        for tag in tags:
+                            picked = await self._type_hashtag(page, cdp, tag)
+                            logger.info(
+                                "[话题] 已输入 #%s (选中联想项: %s)", tag, picked
+                            )
+                    finally:
+                        try:
+                            await cdp.detach()
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.5)
 
                 # Set cover if provided
                 if cover_path:
@@ -1333,10 +1384,9 @@ class DouyinPlatform(BasePlatform):
                     logger.info("[设置合集] 开始设置合集: %s", mix_id)
                     await self._set_image_mix(page, mix_id)
 
-                # Set music if provided
-                if music_name:
-                    logger.info("[选择音乐] 开始选择音乐: %s", music_name)
-                    await self._select_music(page, music_name)
+                # 配乐：用户选了就按名字选，没选就自动补推荐音乐，保证图集有声音
+                logger.info("[选择音乐] 开始确保配乐: %s", music_name or "自动推荐")
+                applied_music = await self._ensure_music(page, music_name)
 
                 # Set hotspot if provided
                 if hotspot:
@@ -1362,6 +1412,21 @@ class DouyinPlatform(BasePlatform):
                         logger.info("[定时发布] 开始设置定时发布...")
                         await self._set_schedule_time(page, publish_date)
                         logger.info("[定时发布] 定时发布设置完成")
+
+                # 发布前自检:音乐与话题是否真的落到了页面上
+                try:
+                    editor_text = (await desc_editor.inner_text()) or ""
+                except Exception:
+                    editor_text = ""
+                logger.info(
+                    "[发布核对] 音乐=%s 描述文本=%s",
+                    applied_music or "无",
+                    editor_text.replace("\n", " ")[:200] or "(空)",
+                )
+                if tags and "#" not in editor_text:
+                    logger.warning(
+                        "[发布核对] 描述里没有 # 话题,话题可能未生效: %s", tags
+                    )
 
                 logger.info("[填写完成] 表单填写完成, 模式: %s", "演练(dry_run)" if dry_run else "正式发布")
 
@@ -1401,7 +1466,28 @@ class DouyinPlatform(BasePlatform):
                     await context.storage_state(path=account_file)
                     logger.info("[发布] Cookie状态已更新")
                 else:
-                    # Dry run mode - simulate publish
+                    # 演练模式：截图留档，按需保留浏览器供人工核对（关闭窗口或到点后结束）
+                    log_dir = Path(BASE_DIR) / "logs"
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        await page.screenshot(
+                            path=str(log_dir / "douyin_image_dryrun.png"), full_page=True
+                        )
+                        logger.info("[发布] 演练截图: %s", log_dir / "douyin_image_dryrun.png")
+                    except Exception:
+                        pass
+                    hold = 0.0
+                    try:
+                        hold = float(os.environ.get("DOUYIN_DRY_RUN_HOLD_SECONDS", "0") or 0)
+                    except ValueError:
+                        hold = 0.0
+                    if hold > 0:
+                        logger.warning(
+                            "[发布] 演练模式保留浏览器 %d 秒供人工核对话题/配乐", int(hold)
+                        )
+                        deadline = time.monotonic() + hold
+                        while browser.is_connected() and time.monotonic() < deadline:
+                            await asyncio.sleep(1)
                     raise RuntimeError('演练模式未实际发布，不计为发布成功')
 
             finally:
@@ -1496,67 +1582,237 @@ class DouyinPlatform(BasePlatform):
             logger.warning("[设置合集] 合集设置失败: %s", e)
 
     # ------------------------------------------------------------------
-    # Helper: select music
+    # Helper: type a hashtag into the focused rich-text editor
     # ------------------------------------------------------------------
 
     @staticmethod
-    async def _select_music(page, music_name: str):
-        """Search and select music."""
+    async def _type_hashtag(page, cdp, tag: str) -> bool:
+        """在当前聚焦的富文本编辑器里输入一个 ``#话题``，返回是否点中联想项。
+
+        ``#`` 必须用 CDP 直发 Shift+3：Playwright keyboard 在 Shift 修饰下会把
+        ``#`` 丢成数字 3，而 ``insert_text`` / ``type`` 不产生 keydown，平台读不到
+        ``event.key='#'`` 就进不了话题联想，最终只剩普通文字（见 CLAUDE.md §6）。
+        """
+        await cdp.send(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "keyDown",
+                "key": "#",
+                "code": "Digit3",
+                "text": "#",
+                "modifiers": 8,  # 8 = Shift
+                "windowsVirtualKeyCode": 51,  # VK_3
+            },
+        )
+        await cdp.send(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "keyUp",
+                "key": "#",
+                "code": "Digit3",
+                "modifiers": 8,
+                "windowsVirtualKeyCode": 51,
+            },
+        )
+        # 等 React onKeyDown/onChange 完成 setState,激活话题联想
+        await asyncio.sleep(0.5)
+
         try:
-            # Click select music button - find the one in the music section
-            # Use XPath to find the specific "选择音乐" button
-            music_btn = page.locator('xpath=//div[contains(@class, "container-right")]//span[text()="选择音乐"]')
-            if not await music_btn.count():
-                # Fallback: find by text and click the visible one
-                music_btn = page.get_by_text("选择音乐", exact=True).last
-            await music_btn.click()
-            await asyncio.sleep(3)
+            editor = page.locator(
+                'div[data-zone-container="*"][contenteditable="true"]'
+            ).first
+            await editor.press_sequentially(tag, delay=150)
+        except Exception:
+            await page.keyboard.type(tag, delay=150)
+        # 等联想列表/话题芯片渲染
+        await asyncio.sleep(1.5)
 
-            # Search music - use placeholder for stability
-            search_input = page.locator('input[placeholder="搜索音乐"]')
-            await search_input.wait_for(state="visible", timeout=5000)
-            await search_input.fill(music_name)
-            await page.keyboard.press("Enter")
-            await asyncio.sleep(3)
-
-            # Find matching music card
-            music_cards = page.locator('div.card-container-tmocjc')
-            count = await music_cards.count()
-            logger.info("[选择音乐] 找到 %d 个音乐卡片", count)
-
-            # Find the card that matches the search text
-            target_card = None
-            for i in range(count):
-                card = music_cards.nth(i)
-                card_text = await card.text_content()
-                if music_name in card_text:
-                    target_card = card
-                    logger.info("[选择音乐] 找到匹配音乐: %s", card_text[:50])
+        # 联想列表里命中同名话题就点选(比空格更稳),否则空格确认
+        suggestions = page.locator('div[role="option"]:visible')
+        try:
+            count = await suggestions.count()
+        except Exception:
+            count = 0
+        fallback = None
+        for i in range(count):
+            option = suggestions.nth(i)
+            try:
+                option_text = (await option.text_content()) or ""
+            except Exception:
+                continue
+            if option_text.strip().startswith(tag):
+                try:
+                    await option.click()
+                    await asyncio.sleep(0.5)
+                    return True
+                except Exception:
                     break
+            if fallback is None and tag in option_text:
+                fallback = option
+        if fallback is not None:
+            try:
+                await fallback.click()
+                await asyncio.sleep(0.5)
+                return True
+            except Exception:
+                pass
 
-            if not target_card and count > 0:
-                # Fallback: use first card
-                target_card = music_cards.first
-                logger.info("[选择音乐] 使用第一个音乐卡片作为兜底")
+        await page.keyboard.press("Space")
+        await asyncio.sleep(0.5)
+        return False
 
-            if target_card:
-                # Hover to show "使用" button
-                await target_card.hover()
-                await asyncio.sleep(1)
+    # ------------------------------------------------------------------
+    # Helper: ensure the image note has music
+    # ------------------------------------------------------------------
 
-                # Click use button within this card
-                use_btn = target_card.locator('button:has-text("使用")')
-                if await use_btn.count():
-                    await use_btn.click(force=True)
-                    logger.info("[选择音乐] 已选择音乐: %s", music_name)
-                else:
-                    logger.warning("[选择音乐] 未找到使用按钮: %s", music_name)
+    @staticmethod
+    async def _ensure_music(page, music_name: str = "") -> str:
+        """确保图集带配乐：指定了歌曲就按名字选，没指定就选推荐第一首。
+
+        音乐面板是 semi-design 的 sidesheet，行 class 名不稳定且整页被
+        ``semi-sidesheet-mask`` 覆盖，这里先用 JS 按「使用人数文本 + 行尺寸」
+        标出每一行，再用 Playwright 对这些行做 hover / 点「使用」。
+
+        返回最终应用的曲名（读回页面状态）。无法确认选中时截图并抛错，
+        避免把无声作品直接发出去。
+        """
+        # 页面已有配乐（如账号默认音乐）就不再动
+        try:
+            if not await page.get_by_text("选择音乐", exact=True).count():
+                logger.info("[选择音乐] 页面已有配乐,跳过")
+                return ""
+        except Exception:
+            pass
+
+        search_input = page.locator('input[placeholder*="搜索音乐"]').first
+
+        try:
+            music_btn = page.locator(
+                'xpath=//div[contains(@class, "container-right")]//span[text()="选择音乐"]'
+            )
+            if await music_btn.count():
+                await music_btn.first.click()
             else:
-                logger.warning("[选择音乐] 未找到音乐卡片: %s", music_name)
-
-            await asyncio.sleep(2)
+                await page.get_by_text("选择音乐", exact=True).last.click()
+            await asyncio.sleep(3)
         except Exception as e:
-            logger.warning("[选择音乐] 选择音乐失败: %s", e)
+            logger.warning("[选择音乐] 打不开音乐面板: %s", e)
+
+        target_idx = None
+        texts: list[str] = []
+        try:
+            if music_name:
+                await search_input.wait_for(state="visible", timeout=5000)
+                await search_input.fill(music_name)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(3)
+        except Exception as e:
+            logger.warning("[选择音乐] 搜索框不可用: %s", e)
+
+        # 在音乐面板里标记可见行：包含「使用」且尺寸像一行（高 50-140、宽 >=280）
+        rows_info = None
+        try:
+            rows_info = await page.evaluate(
+                """
+                () => {
+                  const input = document.querySelector('input[placeholder*="搜索音乐"]');
+                  if (!input) return { error: 'search input not found' };
+                  // 用搜索框反查所属面板（页脚也有 semi-sidesheet 前缀 class，不能取最后一个）
+                  const sheet = [...document.querySelectorAll('[class*="semi-sidesheet"]')]
+                    .find((el) => el.contains(input));
+                  if (!sheet) return { error: 'sidesheet not found' };
+                  document.querySelectorAll('[data-dy-music-row]').forEach(
+                    (el) => el.removeAttribute('data-dy-music-row'));
+                  const cands = [...sheet.querySelectorAll('div')].filter((d) => {
+                    const t = d.textContent || '';
+                    if (!t.includes('使用')) return false;
+                    const r = d.getBoundingClientRect();
+                    return r.height >= 50 && r.height <= 140 && r.width >= 280;
+                  });
+                  // 取最外层候选（一个音乐行），排除被其他候选包含的内层节点
+                  const rows = cands.filter(
+                    (d) => !cands.some((o) => o !== d && o.contains(d)));
+                  rows.forEach((d, i) =>
+                    d.setAttribute('data-dy-music-row', String(i)));
+                  return {
+                    count: rows.length,
+                    texts: rows.map((d) => (d.textContent || '').trim().slice(0, 80)),
+                  };
+                }
+                """
+            )
+        except Exception as e:
+            logger.warning("[选择音乐] 读取音乐列表失败: %s", e)
+
+        if rows_info and rows_info.get("count"):
+            texts = rows_info.get("texts") or []
+            logger.info("[选择音乐] 音乐行数量: %d", rows_info["count"])
+            if music_name:
+                for i, text in enumerate(texts):
+                    if music_name in text:
+                        target_idx = i
+                        break
+                if target_idx is None:
+                    logger.warning("[选择音乐] 未找到 %s,回退推荐第一首", music_name)
+            if target_idx is None:
+                target_idx = 0
+            logger.info("[选择音乐] 目标行 %d: %s", target_idx, texts[target_idx][:50])
+        else:
+            logger.warning(
+                "[选择音乐] 未读到音乐行: %s", (rows_info or {}).get("error", "count=0")
+            )
+
+        if target_idx is not None:
+            row = page.locator(f'div[data-dy-music-row="{target_idx}"]').first
+            try:
+                await row.scroll_into_view_if_needed()
+                await row.hover()
+                await asyncio.sleep(1)
+                # hover 后行内才出现「使用」按钮，点它；没有就直接点行
+                use_btn = row.locator(
+                    'xpath=.//*[self::button or self::div or self::span]'
+                    '[normalize-space(text())="使用"]'
+                )
+                if await use_btn.count():
+                    await use_btn.first.click(force=True)
+                else:
+                    await row.click()
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.warning("[选择音乐] 应用音乐失败: %s", e)
+
+        # 读回页面状态：面板还开着说明没选上
+        panel_open = False
+        try:
+            panel_open = await search_input.is_visible()
+        except Exception:
+            panel_open = False
+
+        if target_idx is None or panel_open:
+            log_dir = Path(BASE_DIR) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                await page.screenshot(path=str(log_dir / "douyin_music_failed.png"))
+            except Exception:
+                pass
+            try:
+                html = await page.evaluate(
+                    """() => {
+                      const input = document.querySelector('input[placeholder*="搜索音乐"]');
+                      const sheet = input && [...document.querySelectorAll('[class*="semi-sidesheet"]')]
+                        .find((el) => el.contains(input));
+                      return (sheet || document.body).outerHTML;
+                    }"""
+                )
+                (log_dir / "douyin_music_panel.html").write_text(html, encoding="utf-8")
+            except Exception:
+                pass
+            raise RuntimeError("抖音图集未能选择配乐,已中止发布(避免发出无声作品)")
+
+        raw = texts[target_idx] if texts else ""
+        applied = music_name or re.split(r"\d+(?:\.\d+)?万?人?使用", raw)[0][-40:].strip()
+        logger.info("[选择音乐] 配乐已应用: %s", applied or "推荐音乐")
+        return applied
 
     # ------------------------------------------------------------------
     # Helper: set hotspot
@@ -1564,16 +1820,40 @@ class DouyinPlatform(BasePlatform):
 
     @staticmethod
     async def _set_hotspot(page, hotspot: str):
-        """Search and select hotspot."""
+        """搜索并选择热点词。
+
+        只用关键词精确匹配到的候选；匹配不上时只记日志、不盲点第一个，
+        避免挂上不相关的热点（旧实现会在 55 个候选里盲选第一条）。
+        """
         try:
-            # Click hotspot - use text for stability (it's a span, not input)
-            hotspot_text = page.get_by_text("点击输入热点词", exact=True)
-            await hotspot_text.click()
+            hotspot_input = page.locator('input[placeholder*="热点"]').first
+            has_input = await hotspot_input.count()
+            if has_input:
+                await hotspot_input.click()
+            else:
+                await page.get_by_text("点击输入热点词", exact=True).click()
             await asyncio.sleep(1)
 
-            # Type hotspot keyword
-            await page.keyboard.insert_text(hotspot)
+            # 用 fill/逐字输入触发 React onChange，insert_text 不会触发搜索联想
+            filled = False
+            if has_input:
+                try:
+                    await hotspot_input.fill("")
+                    await hotspot_input.fill(hotspot)
+                    filled = True
+                except Exception:
+                    filled = False
+            if not filled:
+                await page.keyboard.type(hotspot, delay=120)
             await asyncio.sleep(3)
+
+            if has_input:
+                try:
+                    typed = await hotspot_input.input_value()
+                except Exception:
+                    typed = ""
+                if typed and hotspot not in typed:
+                    logger.warning("[设置热点] 输入框内容与目标不一致: %r", typed)
 
             # Find matching hotspot option in dropdown
             hotspot_options = page.locator('div[role="option"]:not([aria-disabled="true"])')
@@ -1588,11 +1868,11 @@ class DouyinPlatform(BasePlatform):
                 count = await hotspot_options.count()
             logger.info("[设置热点] 找到 %d 个热点选项", count)
 
-            # Click the option that matches the search text
+            # 只点文本包含关键词的候选
             clicked = False
             for i in range(count):
                 option = hotspot_options.nth(i)
-                option_text = await option.text_content()
+                option_text = (await option.text_content()) or ""
                 if hotspot in option_text:
                     await option.click()
                     logger.info("[设置热点] 已选择热点: %s (匹配: %s)", hotspot, option_text[:50])
@@ -1600,14 +1880,16 @@ class DouyinPlatform(BasePlatform):
                     break
 
             if not clicked:
-                # Fallback: click first option if no exact match
-                if count > 0:
-                    await hotspot_options.first.click()
-                    logger.info("[设置热点] 已选择热点: %s (第一个选项)", hotspot)
-                else:
-                    logger.warning("[设置热点] 未找到热点: %s, 尝试回车", hotspot)
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(1)
+                candidates = []
+                for i in range(min(count, 3)):
+                    try:
+                        candidates.append(((await hotspot_options.nth(i).text_content()) or "")[:40])
+                    except Exception:
+                        pass
+                logger.warning(
+                    "[设置热点] 未找到匹配 %s 的热点,已跳过(候选前3: %s)",
+                    hotspot, candidates,
+                )
 
             await asyncio.sleep(1)
         except Exception as e:
