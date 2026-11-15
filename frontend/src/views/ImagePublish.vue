@@ -164,6 +164,22 @@
             @config-changed="onChannelConfigChanged"
             @publish-result="onPublishResult"
           />
+          <ChannelsImagePublishPanel
+            ref="channelsPanelRef"
+            :account-id="selectedPlatform === 'channels' ? selectedAccountId : null"
+            :disabled="publishing"
+            v-show="selectedPlatform === 'channels'"
+            @config-changed="onChannelConfigChanged"
+            @publish-result="onPublishResult"
+          />
+          <TaobaoGuangheImagePublishPanel
+            ref="taobaoGuanghePanelRef"
+            :account-id="selectedPlatform === 'taobao_guanghe' ? selectedAccountId : null"
+            :disabled="publishing"
+            v-show="selectedPlatform === 'taobao_guanghe'"
+            @config-changed="onChannelConfigChanged"
+            @publish-result="onPublishResult"
+          />
         </div>
 
         <!-- No account selected hint -->
@@ -334,6 +350,8 @@ import KuaishouImagePublishPanel from '@/components/kuaishou/ImagePublishPanel.v
 import WeiboImagePublishPanel from '@/components/weibo/ImagePublishPanel.vue'
 import AlipayImagePublishPanel from '@/components/alipay/ImagePublishPanel.vue'
 import WeixinGzhImagePublishPanel from '@/components/weixin_gzh/ImagePublishPanel.vue'
+import ChannelsImagePublishPanel from '@/components/channels/ImagePublishPanel.vue'
+import TaobaoGuangheImagePublishPanel from '@/components/taobao_guanghe/ImagePublishPanel.vue'
 import PrePublishCheckDialog from '@/components/PrePublishCheckDialog.vue'
 import GuideTour from '@/components/GuideTour.vue'
 import { imageGuideSteps, GUIDE_KEYS, isGuideDone, markGuideDone } from '@/config/guides'
@@ -346,7 +364,7 @@ appStore.loadAccountCheckMode()
 appStore.loadAutoSaveSettings()
 const route = useRoute()
 
-const IMAGE_PLATFORM_KEYS = ['xiaohongshu', 'douyin', 'kuaishou', 'weibo', 'alipay', 'weixin_gzh']
+const IMAGE_PLATFORM_KEYS = ['xiaohongshu', 'douyin', 'kuaishou', 'weibo', 'alipay', 'weixin_gzh', 'channels', 'taobao_guanghe']
 const IMAGE_PLATFORMS = platformList.filter(p => IMAGE_PLATFORM_KEYS.includes(p.key))
 
 // ========== Left Sidebar State ==========
@@ -436,9 +454,11 @@ const kuaishouPanelRef = ref(null)
 const weiboPanelRef = ref(null)
 const alipayPanelRef = ref(null)
 const weixinGzhPanelRef = ref(null)
+const channelsPanelRef = ref(null)
+const taobaoGuanghePanelRef = ref(null)
 
 function getPanel(key) {
-  const map = { douyin: douyinPanelRef, xiaohongshu: xiaohongshuPanelRef, kuaishou: kuaishouPanelRef, weibo: weiboPanelRef, alipay: alipayPanelRef, weixin_gzh: weixinGzhPanelRef }
+  const map = { douyin: douyinPanelRef, xiaohongshu: xiaohongshuPanelRef, kuaishou: kuaishouPanelRef, weibo: weiboPanelRef, alipay: alipayPanelRef, weixin_gzh: weixinGzhPanelRef, channels: channelsPanelRef, taobao_guanghe: taobaoGuanghePanelRef }
   return map[key]?.value
 }
 
@@ -458,7 +478,7 @@ function onPublishResult({ accountName, status, message }) {
 function hasAccountOverride(accountId) {
   // Task 10：新增覆写层勾选 + panel 内部 accountOverrides 任一为真都算
   if (accountChecked[accountId] && hasAccountOverrideContent(accountId)) return true
-  for (const key of ['douyin', 'xiaohongshu', 'kuaishou', 'weibo', 'alipay', 'weixin_gzh']) {
+  for (const key of ['douyin', 'xiaohongshu', 'kuaishou', 'weibo', 'alipay', 'weixin_gzh', 'channels', 'taobao_guanghe']) {
     const panel = getPanel(key)
     if (panel && panel.hasAccountOverride(accountId)) return true
   }
@@ -560,6 +580,8 @@ const panelsProxy = reactive({
   get weibo() { return weiboPanelRef.value },
   get alipay() { return alipayPanelRef.value },
   get weixin_gzh() { return weixinGzhPanelRef.value },
+  get channels() { return channelsPanelRef.value },
+  get taobao_guanghe() { return taobaoGuanghePanelRef.value },
 })
 const { applyImageBatchSet } = useImageBatchSetApply({ panels: panelsProxy, accountStore })
 // 渠道个性化可见平台列表：过滤掉被拉黑的平台
@@ -712,7 +734,7 @@ async function saveDraft() {
   try {
     const allPlatformConfigs = {}
     const panelAccountOverrides = {}
-    for (const key of ['douyin', 'xiaohongshu', 'kuaishou', 'weibo', 'alipay', 'weixin_gzh']) {
+    for (const key of ['douyin', 'xiaohongshu', 'kuaishou', 'weibo', 'alipay', 'weixin_gzh', 'channels', 'taobao_guanghe']) {
       const panel = getPanel(key)
       if (panel) {
         const configs = panel.getConfigs()
@@ -977,7 +999,7 @@ function handleOneClickFill(record) {
 // ========== Old Draft Migration ==========
 function migrateOldDraftFormat(dd) {
   if (dd.commonConfig?.topics && Array.isArray(dd.commonConfig.topics)) {
-    for (const key of ['douyin', 'xiaohongshu', 'kuaishou', 'weibo', 'alipay', 'weixin_gzh']) {
+    for (const key of ['douyin', 'xiaohongshu', 'kuaishou', 'weibo', 'alipay', 'weixin_gzh', 'channels', 'taobao_guanghe']) {
       if (dd.platformConfigs?.[key]) {
         dd.platformConfigs[key].tags = [...dd.commonConfig.topics]
       }

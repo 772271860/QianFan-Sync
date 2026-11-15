@@ -713,6 +713,13 @@ def login():
         except asyncio.CancelledError:
             logger.info(f"[login] 用户关闭了浏览器，{platform.platform_name} 登录取消")
             status_queue.put(json.dumps({"status": "error", "msg": "用户关闭了浏览器"}))
+        except Exception as e:
+            # 任何未处理异常都要回传前端，否则前端 SSE 一直等待、按钮一直转圈
+            logger.exception(f"[login] {platform.platform_name} 登录失败: {e}")
+            status_queue.put(json.dumps({
+                "status": "error",
+                "msg": str(e) or type(e).__name__,
+            }))
 
     thread = threading.Thread(
         target=_run_login,

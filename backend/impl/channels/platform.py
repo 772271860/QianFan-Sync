@@ -45,6 +45,9 @@ TENCENT_LOGIN_URL = "https://channels.weixin.qq.com/login.html"
 TENCENT_PLATFORM_URL = "https://channels.weixin.qq.com/platform"
 TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
+# 图文(图片动态)编辑页与列表页
+TENCENT_IMAGE_CREATE_URL = "https://channels.weixin.qq.com/platform/post/finderNewLifeCreate"
+TENCENT_IMAGE_LIST_PATH = "/post/finderNewLifePostList"
 
 # 调试开关:True = 走到发布按钮时只输出参数日志、不实际点击发布(便于检查内容);
 # False = 正常点击发布。默认关闭(真实发布),需要模拟时设环境变量
@@ -93,6 +96,47 @@ async def _upload_video_file(page, file_path: str) -> None:
     await file_input.set_input_files(file_path)
 
 
+async def _type_hashtag(page, cdp, tag: str) -> None:
+    """在已聚焦的富文本编辑器里输入一个 #话题。
+
+    话题识别依赖真实 keydown：``keyboard.type`` 走插入文本、不产生 keydown，
+    平台读不到 '#' 就进不了话题联想，最终只剩一段普通文字。因此 '#' 用 CDP
+    直发 Shift+3（见 CLAUDE.md §6），标签内容逐字键入，空格确认。
+    """
+    await cdp.send(
+        "Input.dispatchKeyEvent",
+        {
+            "type": "keyDown",
+            "key": "#",
+            "code": "Digit3",
+            "text": "#",
+            "modifiers": 8,  # 8 = Shift
+            "windowsVirtualKeyCode": 51,  # VK_3
+        },
+    )
+    await cdp.send(
+        "Input.dispatchKeyEvent",
+        {
+            "type": "keyUp",
+            "key": "#",
+            "code": "Digit3",
+            "modifiers": 8,
+            "windowsVirtualKeyCode": 51,
+        },
+    )
+    # 等 React onKeyDown/onChange 完成 setState,激活话题识别状态
+    await asyncio.sleep(0.5)
+    editor = page.locator("div.input-editor").first
+    if await editor.count():
+        await editor.press_sequentially(tag, delay=150)
+    else:
+        await page.keyboard.type(tag, delay=150)
+    # 等联想列表/话题芯片渲染,再空格确认
+    await asyncio.sleep(1.0)
+    await page.keyboard.press("Space")
+    await asyncio.sleep(0.5)
+
+
 async def _fill_title_and_tags(page, title: str, tags: list[str]) -> None:
     """Type hashtags into the rich-text description editor.
 
@@ -100,13 +144,15 @@ async def _fill_title_and_tags(page, title: str, tags: list[str]) -> None:
     「短标题」输入框；正文/描述区只放描述和话题标签。
     """
     await page.locator("div.input-editor").click()
-    for tag in tags:
-        await page.keyboard.type("#" + tag, delay=30)
-        await page.keyboard.press("Space")
-        # 每个标签输入完后停 0.5s,让 React 完整消化上一个 onChange
-        # 避免下一个标签的 '#' 字符和上一个 setState 在异步上撞车,
-        # 出现「最后一个标签没空格」/ 字符丢失 / 标签粘连等问题
-        await asyncio.sleep(0.5)
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        for tag in tags:
+            await _type_hashtag(page, cdp, tag)
+    finally:
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
     logger.info(f"[填写标题] added {len(tags)} hashtags to description editor")
 
 
@@ -1254,6 +1300,439 @@ async def _submit_publish(page, is_draft: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 图文(图片动态) helpers
+#
+# 图文编辑页是 Wujie 微前端:真实 DOM 渲染在外层页面 <wujie-app> 的
+# shadow root 里,``/micro/`` iframe 只是空的 JS 沙箱(body 无内容)。
+# 因此这里统一在外层 page 上用深度查询穿透 shadow root:
+#   - page.evaluate: 读写表单、读取按钮坐标
+#   - page.mouse.click: 真实鼠标点击(isTrusted=true, 与真人一致)
+#   - CDP DOM.setFileInputFiles: 给隐藏的 file input 灌图片(pierce 穿透 shadow)
+# ---------------------------------------------------------------------------
+
+
+async def _wait_image_create_frame(page, timeout: int = 60):
+    """等待图文编辑页(wujie shadow DOM)渲染出「图文标题」输入框。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        raise_if_page_closed(page)
+        try:
+            count = await page.evaluate(
+                """() => {
+                  const out = [];
+                  const walk = (root) => {
+                    root.querySelectorAll('input[placeholder*="填写标题"]')
+                      .forEach((e) => out.push(e));
+                    root.querySelectorAll('*').forEach((e) => {
+                      if (e.shadowRoot) walk(e.shadowRoot);
+                    });
+                  };
+                  walk(document);
+                  return out.length;
+                }"""
+            )
+            if count:
+                return page
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    raise RuntimeError("视频号图文编辑页未就绪(未找到图文标题输入框)")
+
+
+def _collect_file_inputs(node, out):
+    """在 CDP DOM 树(含 iframe/shadow)中收集 file input 的 nodeId 与属性。"""
+    if node.get("nodeName") == "INPUT":
+        attrs = node.get("attributes") or []
+        attr_map = dict(zip(attrs[0::2], attrs[1::2]))
+        if attr_map.get("type") == "file":
+            out.append({"nodeId": node["nodeId"], "attrs": attr_map})
+    for key in ("children", "shadowRoots"):
+        for child in node.get(key) or []:
+            _collect_file_inputs(child, out)
+    if node.get("contentDocument"):
+        _collect_file_inputs(node["contentDocument"], out)
+    return out
+
+
+async def _deep_count(page, selector: str) -> int:
+    """穿透 shadow root 统计元素数量。"""
+    return await page.evaluate(
+        """(sel) => {
+          let n = 0;
+          const walk = (root) => {
+            n += root.querySelectorAll(sel).length;
+            root.querySelectorAll('*').forEach((e) => {
+              if (e.shadowRoot) walk(e.shadowRoot);
+            });
+          };
+          walk(document);
+          return n;
+        }""",
+        selector,
+    )
+
+
+async def _submit_files_via_cdp(cdp, files: list[str]) -> None:
+    """用 CDP 把文件灌进第一个 file input(穿透 shadow DOM)。"""
+    doc = await cdp.send("DOM.getDocument", {"depth": -1, "pierce": True})
+    candidates = _collect_file_inputs(doc["root"], [])
+    if not candidates:
+        raise RuntimeError("未找到视频号图文上传输入框")
+    await cdp.send(
+        "DOM.setFileInputFiles",
+        {"files": files, "nodeId": candidates[0]["nodeId"]},
+    )
+    logger.info(
+        "[上传图片] CDP 提交 %d 张图片(accept=%s)",
+        len(files), candidates[0]["attrs"].get("accept", ""),
+    )
+
+
+async def _submit_files_via_locator(page, files: list[str]) -> None:
+    """用 Playwright 原生 set_input_files 提交(同样能穿透 shadow DOM)。"""
+    await page.locator('input[type="file"]').first.set_input_files(files)
+    logger.info("[上传图片] Playwright 提交 %d 张图片", len(files))
+
+
+async def _upload_images(page, files: list[str], timeout: int = 180):
+    """把图片灌进视频号图文编辑页的隐藏 file input,并等待上传完成。
+
+    wujie 微前端里 CDP 的 DOM.setFileInputFiles 偶尔灌进去不生效
+    (input.files 仍为 0,页面毫无反应),所以和 Playwright 原生
+    set_input_files 交替重试,每次给 10 秒反应时间,最多 6 次。
+    页面刚挂载时 img 数量会抖动,基线取两次采样的较小值。
+    """
+    await asyncio.sleep(2)  # 等编辑页渲染稳定
+    samples = [await _deep_count(page, "img")]
+    await asyncio.sleep(1)
+    samples.append(await _deep_count(page, "img"))
+    baseline = min(samples)
+
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        await cdp.send("DOM.enable")
+    except Exception:
+        cdp = None
+
+    methods = ("locator", "cdp", "locator", "cdp", "locator", "cdp")
+    attempts = 0
+    last_submit = 0.0
+    last_log = 0.0
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            raise_if_page_closed(page)
+            try:
+                count = await _deep_count(page, "img")
+            except Exception as exc:
+                if time.time() - last_log > 5:
+                    last_log = time.time()
+                    logger.info("[上传图片] 轮询异常: %s", exc)
+                await asyncio.sleep(1)
+                continue
+
+            if count >= baseline + len(files):
+                await asyncio.sleep(2)  # 等缩略图与进度条稳定
+                logger.info("[上传图片] 上传完成: img %s -> %s", baseline, count)
+                return page
+
+            now = time.time()
+            # 已有图片进编辑器,只等剩下的传完,不再重复灌文件
+            if count > baseline or now - last_submit < 10:
+                if now - last_log > 5:
+                    last_log = now
+                    logger.info("[上传图片] 等待中: img %s -> %s", baseline, count)
+                await asyncio.sleep(1)
+                continue
+
+            if attempts >= len(methods):
+                break
+
+            method = methods[attempts]
+            attempts += 1
+            last_submit = now
+            try:
+                if method == "cdp" and cdp is not None:
+                    await _submit_files_via_cdp(cdp, files)
+                else:
+                    await _submit_files_via_locator(page, files)
+            except Exception as exc:
+                logger.info("[上传图片] %s 方式提交失败: %s", method, exc)
+    finally:
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+
+    try:
+        log_dir = Path(BASE_DIR) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(log_dir / "channels_image_upload_failed.png"))
+    except Exception:
+        pass
+    raise RuntimeError("图片上传超时")
+
+
+async def _fill_image_text(page, title: str, desc: str, tags: list[str]) -> None:
+    """填图文标题(≤22 字)、描述和话题标签(wujie shadow DOM)。"""
+    if title:
+        await page.evaluate(
+            """(value) => {
+              const out = [];
+              const walk = (root) => {
+                root.querySelectorAll('input[placeholder*="填写标题"]')
+                  .forEach((e) => out.push(e));
+                root.querySelectorAll('*').forEach((e) => {
+                  if (e.shadowRoot) walk(e.shadowRoot);
+                });
+              };
+              walk(document);
+              const input = out[0];
+              if (!input) throw new Error('未找到图文标题输入框');
+              const setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype, 'value').set;
+              setter.call(input, value);
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            title[:22],
+        )
+        logger.info("[填写] 图文标题: %s", title[:22])
+
+    valid_tags = [str(t).strip().lstrip("#") for t in tags if str(t).strip().lstrip("#")]
+    if not desc and not valid_tags:
+        return
+    # contenteditable 无法用 JS 直接写(React 会读不到),聚焦后走真实键盘输入
+    await page.evaluate(
+        """() => {
+          const out = [];
+          const walk = (root) => {
+            root.querySelectorAll('div.input-editor').forEach((e) => out.push(e));
+            root.querySelectorAll('*').forEach((e) => {
+              if (e.shadowRoot) walk(e.shadowRoot);
+            });
+          };
+          walk(document);
+          const ed = out[0];
+          if (!ed) throw new Error('未找到图文描述编辑器');
+          ed.focus();
+        }"""
+    )
+    if desc:
+        await page.keyboard.type(desc, delay=10)
+        logger.info("[填写] 图文描述: %d 字", len(desc))
+    if valid_tags:
+        cdp = await page.context.new_cdp_session(page)
+        try:
+            for tag in valid_tags:
+                await _type_hashtag(page, cdp, tag)
+        finally:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+        logger.info("[填写] 话题标签: %d 个", len(valid_tags))
+
+
+def _image_publish_finished(page) -> bool:
+    """发表/存草稿后页面会回到图文列表页(外层页或 iframe 都可能)。"""
+    if TENCENT_IMAGE_LIST_PATH in page.url:
+        return True
+    for frame in page.frames:
+        if TENCENT_IMAGE_LIST_PATH in frame.url:
+            return True
+    return False
+
+
+async def _click_button(page, label: str) -> bool:
+    """用真实鼠标点击 shadow DOM 内文字精确等于 label 的最小可见按钮。
+
+    JS ``el.click()`` 产生的是 isTrusted=false 的合成事件;这里先取元素
+    中心坐标,再用 ``page.mouse.click`` 派发真实鼠标事件,与真人点击一致。
+    """
+    rect = await page.evaluate(
+        """(label) => {
+          const out = [];
+          const walk = (root) => {
+            root.querySelectorAll('button').forEach((e) => out.push(e));
+            root.querySelectorAll('*').forEach((e) => {
+              if (e.shadowRoot) walk(e.shadowRoot);
+            });
+          };
+          walk(document);
+          const candidates = out.filter(
+            (b) => (b.innerText || '').trim() === label
+                   && (b.offsetWidth || b.offsetHeight)
+          );
+          if (!candidates.length) return null;
+          candidates.sort((a, b) => a.children.length - b.children.length);
+          const btn = candidates[0];
+          btn.scrollIntoView({ block: 'center', inline: 'center' });
+          const r = btn.getBoundingClientRect();
+          if (!r.width || !r.height) return null;
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        }""",
+        label,
+    )
+    if not rect:
+        return False
+    await page.mouse.click(rect["x"], rect["y"])
+    return True
+
+
+async def _fetch_recent_post_ids(page, size: int = 10) -> set[str]:
+    """用页面登录态读取账号最近图文列表的 objectId(只读)。"""
+    ids = await page.evaluate(
+        """async (size) => {
+          const r = await fetch('/cgi-bin/mmfinderassistant-bin/post/post_list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pageSize: size }),
+            credentials: 'include',
+          });
+          const j = await r.json();
+          return ((j.data && j.data.list) || []).map((it) => it.objectId);
+        }""",
+        size,
+    )
+    return {i for i in ids if i}
+
+
+async def _submit_image_publish(page, is_draft: bool = False) -> None:
+    """点击「保存草稿」/「发表」,并确认内容确实落到账号里。
+
+    视频号图文保存草稿/发表后页面不跳转。发表前平台会先调
+    ``check_finder_comm_face`` 之类的预检接口,它的 errCode=0 只代表
+    预检通过,不能当发布成功。因此:
+      - 草稿:以 ``post_draft`` 接口 errCode=0 为准;
+      - 发表:点击后轮询图文列表(同一登录态),列表里出现发布前没有的
+        objectId 才算成功;预检失败或发表接口报错立即中止。
+    """
+    if not is_draft and manual_review_enabled():
+        await wait_for_manual_publish(page, 'channels')
+        return
+    label = "保存草稿" if is_draft else "发表"
+    clicked = False
+    pending = {}  # requestId -> url(已收到响应)
+    cdp = await page.context.new_cdp_session(page)
+
+    def on_request(ev):
+        url = ev.get("request", {}).get("url", "")
+        if "/mmfinderassistant-bin/post/" in url and "/helper/" not in url:
+            pending[ev["requestId"]] = url
+
+    # 发表基准:点击前账号里已有的图文 objectId
+    baseline_ids = None
+    if not is_draft:
+        try:
+            baseline_ids = await _fetch_recent_post_ids(page)
+            logger.info("[发布] 图文列表基线: %d 条", len(baseline_ids))
+        except Exception as exc:
+            logger.warning("[发布] 读取图文列表基线失败,跳过列表核对: %s", exc)
+
+    await cdp.send("Network.enable")
+    cdp.on("Network.requestWillBeSent", on_request)
+
+    done = set()
+    next_list_check = 0.0
+    try:
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            raise_if_page_closed(page)
+            # 发表成功后可能跳回图文列表
+            if _image_publish_finished(page):
+                logger.info("[发布] 图文%s成功(已跳回列表)", "草稿保存" if is_draft else "发布")
+                return
+            # 检查已响应的接口
+            for request_id, url in list(pending.items()):
+                if request_id in done:
+                    continue
+                path = url.split("?")[0]
+                is_draft_api = "post_draft" in path
+                if is_draft_api != is_draft:
+                    # 发表流程里只有 post_draft 是草稿接口,其余按发表处理
+                    continue
+                if is_draft_api and not clicked:
+                    # 编辑期间可能自动存草稿,只认点击「保存草稿」之后的响应
+                    continue
+                try:
+                    body = await cdp.send(
+                        "Network.getResponseBody", {"requestId": request_id}
+                    )
+                except Exception:
+                    continue
+                done.add(request_id)
+                try:
+                    payload = json.loads(body.get("body") or "{}")
+                except Exception:
+                    payload = {}
+                ok = payload.get("errCode") == 0 or payload.get("ret") == 0
+                if is_draft_api:
+                    if ok:
+                        logger.info("[发布] 图文草稿保存成功: %s", path)
+                        return
+                    raise RuntimeError(
+                        f"图文草稿保存失败: {payload.get('errMsg') or payload}"
+                    )
+                # 发表前的 check_* 预检:通过只代表预检过了,失败直接中止
+                if "/post/check_" in path:
+                    if not ok:
+                        raise RuntimeError(
+                            f"图文发布被拦截: {payload.get('errMsg') or payload}"
+                        )
+                    logger.info("[发布] 预检通过(%s),等待发布结果", path.rsplit("/", 1)[-1])
+                    continue
+                if ok:
+                    logger.info("[发布] 发表接口返回成功: %s,等待列表确认", path)
+                else:
+                    raise RuntimeError(
+                        f"图文发布失败: {payload.get('errMsg') or payload}"
+                    )
+            # 发表后按列表核对,每 2 秒一次
+            if (
+                not is_draft
+                and clicked
+                and baseline_ids is not None
+                and time.time() >= next_list_check
+            ):
+                next_list_check = time.time() + 2
+                try:
+                    ids = await _fetch_recent_post_ids(page)
+                except Exception as exc:
+                    logger.info("[发布] 列表核对失败(稍后重试): %s", exc)
+                    ids = None
+                if ids is not None:
+                    new_ids = ids - baseline_ids
+                    if new_ids:
+                        logger.info(
+                            "[发布] 图文发布成功(列表已出现新内容: %s)",
+                            next(iter(new_ids)),
+                        )
+                        return
+            # 点击提交(只点一次,避免重复创建)
+            try:
+                if await _click_button(page, "我知道了"):
+                    logger.info("[发布] 检测到「我知道了」弹窗,已点击关闭")
+                    await asyncio.sleep(0.5)
+                    continue
+                if not clicked and await _click_button(page, label):
+                    clicked = True
+                    logger.info("[发布] 已点击「%s」", label)
+            except Exception as exc:
+                logger.info("[发布] 提交中... (%s)", exc)
+            await asyncio.sleep(0.5)
+        raise RuntimeError(
+            f"图文{'草稿保存' if is_draft else '发布'}未完成,当前页面: {page.url}"
+        )
+    finally:
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Platform class
 # ---------------------------------------------------------------------------
 
@@ -1804,4 +2283,90 @@ class ChannelsPlatform(BasePlatform):
         logger.info("=" * 60)
         logger.info("[发布视频] 视频发布流程完成!")
         logger.info("=" * 60)
+        return True
+
+
+    def publish_image(self, **kwargs) -> bool:
+        """发布视频号图文(图片动态)。
+
+        Accepted keyword arguments:
+
+        - ``title`` (*str*) -- 图文标题(平台限制 22 字,超出截断)
+        - ``desc`` (*str*) -- 图文描述
+        - ``tags`` (*list[str]*) -- 话题标签
+        - ``files`` (*list[str]*) -- 图片绝对路径
+        - ``account_file`` (*list[str]*) -- cookie 文件名称
+        - ``dry_run`` (*bool*, optional) -- 演练:填完表单不提交,保留浏览器
+        - ``is_draft`` (*bool*, optional) -- 只保存草稿
+        """
+        title = kwargs.get("title", "") or ""
+        desc = kwargs.get("desc", "") or ""
+        tags = kwargs.get("tags", []) or []
+        files = [str(f) for f in (kwargs.get("files") or [])]
+        account_files = kwargs.get("account_file", []) or []
+        dry_run = bool(kwargs.get("dry_run", False))
+        is_draft = bool(kwargs.get("is_draft", False))
+
+        if not files:
+            raise RuntimeError("视频号图文发布缺少图片文件")
+        if not account_files:
+            raise RuntimeError("视频号图文发布缺少账号 cookie")
+
+        resolved_accounts = [
+            str(Path(BASE_DIR / "cookiesFile" / a)) for a in account_files
+        ]
+
+        logger.info("=" * 60)
+        logger.info(
+            "[发布图文] 开始视频号图文发布,标题: %s,图片 %d 张,标签 %d 个",
+            title, len(files), len(tags),
+        )
+        logger.info("=" * 60)
+
+        async def _do_publish():
+            for cookie_path in resolved_accounts:
+                cookie_name = Path(cookie_path).name
+                nick = get_account_name_by_cookie_file(cookie_name)
+                with bind_account_name(nick or "-"):
+                    browser = await self.create_browser(headless=False)
+                    context = None
+                    keep_browser_open = False
+                    try:
+                        context = await self.create_context(
+                            browser, storage_state=cookie_path
+                        )
+                        page = await context.new_page()
+                        await page.goto(TENCENT_IMAGE_CREATE_URL, timeout=60000)
+                        if "login" in page.url:
+                            raise RuntimeError("视频号登录已失效,请重新登录账号")
+
+                        await _wait_image_create_frame(page)
+                        await _upload_images(page, files)
+                        await _fill_image_text(page, title, desc, tags)
+                        await pause_after_input()
+
+                        if dry_run or _PUBLISH_DRY_RUN:
+                            logger.info("[发布图文] DRY_RUN: 浏览器停留在图文编辑页,请人工检查")
+                            keep_browser_open = True
+                            raise RuntimeError("演练模式未实际发布，不计为发布成功")
+
+                        await _submit_image_publish(page, is_draft)
+                        await context.storage_state(path=cookie_path)
+                        logger.info("[发布图文] Cookie状态已更新")
+                    finally:
+                        if keep_browser_open:
+                            logger.info("[发布图文] DRY_RUN: 跳过收尾,窗口停留在编辑页")
+                        else:
+                            if context is not None:
+                                try:
+                                    await context.close()
+                                except Exception:
+                                    pass
+                            try:
+                                await self.close_browser(browser, is_close_by_code=True)
+                            except Exception:
+                                pass
+
+        asyncio.run(_do_publish())
+        logger.info("[发布图文] 视频号图文发布流程完成")
         return True

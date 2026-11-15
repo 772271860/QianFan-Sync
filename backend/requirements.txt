@@ -8,5 +8,8 @@ segno>=1.6.6
 xhs>=0.2.13
 waitress>=3.0.0
 cloakbrowser>=0.3
+# 可选后端：BROWSER_BACKEND=patchright 时启用（免 license 的 Playwright 补丁版）
+# 安装后需执行: patchright install chromium chromium-headless-shell
+patchright>=1.64.4
 Pillow>=11.0.0
 boto3>=1.35.0

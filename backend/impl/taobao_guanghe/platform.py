@@ -56,6 +56,16 @@ _PUBLISH_SUCCESS_URL_MARK = "/page/workspace/tb"
 _GUANGHE_MAX_TITLE_LEN = 30       # 标题 ≤30 字
 _GUANGHE_MAX_DESC_LEN = 1000      # 描述（含#标签）≤1000 字
 
+# 图文发布页 URL（pub_url 指向 huodong 的 gg-picture 编辑器）
+_GUANGHE_IMAGE_PUBLISH_URL = (
+    "https://creator.guanghe.taobao.com/page/pubNew/pic"
+    "?pub_url=https%3A%2F%2Fhuodong.taobao.com%2Fwow%2Fz%2Fguang%2Fgg_publish%2Fgg-picture"
+    "%3Fugc_scene%3Dpc_newcreator_pic%26pageType%3Darticle%26site%3Dguangguang"
+    "&pub_scene=gg"
+)
+_GUANGHE_MAX_IMAGE_COUNT = 9      # 图文最多 9 张
+_GUANGHE_IMAGE_FOLDER = "光合"    # 图片上传到的素材库文件夹
+
 # 创作者声明可选项（与前端 settingsFields 保持一致）
 _CLAIM_OPTIONS = [
     "内容无需标注",
@@ -732,8 +742,561 @@ class TaobaoGuanghePlatform(BasePlatform):
         return True
 
     # ------------------------------------------------------------------
+    # publish_image
+    # ------------------------------------------------------------------
+
+    def publish_image(self, **kwargs) -> bool:
+        """发布图文到淘宝光合。
+
+        接受的 kwargs（由 image_publish_bp 统一传入）:
+        - ``title`` (*str*) — 标题（≤30 字符）
+        - ``files`` (*list[str]*) — 图片绝对路径（最多 9 张）
+        - ``tags`` (*list[str]*) — 标签（拼到描述里，以 #xxx 形式）
+        - ``account_file`` (*list[str]*) — cookie 文件名列表
+        - ``desc`` (*str*, 可选) — 描述（含#标签 ≤1000 字符）
+        - ``guanghe_claim`` (*str*, 可选) — 创作者声明值
+        - ``dry_run`` (*bool*, 可选) — 演练：填完表单不提交，保留浏览器
+        """
+        title = kwargs.get("title", "") or ""
+        files = [str(f) for f in (kwargs.get("files") or [])]
+        tags = kwargs.get("tags") or []
+        account_files = kwargs.get("account_file", []) or []
+        desc = kwargs.get("desc", "") or ""
+        claim = kwargs.get("guanghe_claim", "") or ""
+        dry_run = bool(kwargs.get("dry_run", False))
+
+        if not files:
+            raise RuntimeError("淘宝光合图文发布缺少图片文件")
+        if not account_files:
+            raise RuntimeError("淘宝光合图文发布缺少账号 cookie")
+
+        if len(files) > _GUANGHE_MAX_IMAGE_COUNT:
+            logger.info(
+                "[发布图文] 图片 %d 张超过上限 %d，截断",
+                len(files), _GUANGHE_MAX_IMAGE_COUNT,
+            )
+            files = files[:_GUANGHE_MAX_IMAGE_COUNT]
+
+        cookie_paths = [
+            str(Path(BASE_DIR / "cookiesFile") / f) for f in account_files
+        ]
+
+        async def _run():
+            logger.info("=" * 60)
+            logger.info(
+                "[发布图文] 开始淘宝光合图文发布，标题: %s，图片 %d 张，标签 %d 个",
+                title, len(files), len(tags),
+            )
+            logger.info("=" * 60)
+
+            for cookie_index, cookie_path in enumerate(cookie_paths):
+                cookie_name = Path(cookie_path).name
+                nick = get_account_name_by_cookie_file(cookie_name)
+                with bind_account_name(nick or "-"):
+                    logger.info(
+                        "[发布图文] 发布到第 %d/%d 个账号 (%s)",
+                        cookie_index + 1, len(cookie_paths), nick or "未知",
+                    )
+                    await self._upload_single_image(
+                        title=title,
+                        files=files,
+                        tags=tags,
+                        account_file=cookie_path,
+                        desc=desc,
+                        claim=claim,
+                        dry_run=dry_run,
+                    )
+
+            logger.info("=" * 60)
+            logger.info("[发布图文] 图文发布流程完成!")
+            logger.info("=" * 60)
+
+        asyncio.run(_run())
+        return True
+
+    # ------------------------------------------------------------------
     # Internal upload helpers
     # ------------------------------------------------------------------
+
+    async def _upload_single_image(
+        self,
+        title: str,
+        files: list,
+        tags: list,
+        account_file: str,
+        desc: str = "",
+        claim: str = "",
+        dry_run: bool = False,
+    ) -> None:
+        """上传一组图片并发布图文到一个光合账号。
+
+        失败时直接 raise，异常会传到 publish_image → image_publish_bp 的 except。
+        """
+        log_dir = Path(BASE_DIR / "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        browser = await self.create_browser(headless=False)
+        try:
+            context = await self.create_context(browser, storage_state=account_file)
+            upload_success = False
+            try:
+                page = await context.new_page()
+
+                # 0. 直接 goto 图文发布页（带 cookie）
+                logger.info("[上传图文] 打开发布页: %s", _GUANGHE_IMAGE_PUBLISH_URL[:80])
+                await page.goto(
+                    _GUANGHE_IMAGE_PUBLISH_URL,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await asyncio.sleep(3)
+
+                current_url = page.url or ""
+                if any(m in current_url for m in _COOKIE_INVALID_MARKERS):
+                    raise RuntimeError("淘宝光合 cookie 失效，请重新登录")
+
+                # 0.5 关闭新手引导弹窗
+                await self._dismiss_guide_modal(page)
+
+                # 1. 定位图文编辑 iframe（交叉域 gg-picture）
+                frame = await self._find_image_publish_frame(page)
+
+                # 2. 上传图片（最多 9 张）
+                await self._upload_images(page, frame, files)
+                await self._wait_images_uploaded(frame, expected=len(files))
+
+                # 3. 标题（≤30 字符）
+                await self._fill_image_title(frame, title)
+
+                # 4. 描述 + 标签（rich-text-content 富文本，≤1000 字符）
+                await self._fill_image_desc_and_tags(frame, desc, tags)
+
+                # 5. 创作者声明（光合必填，未选时默认"内容无需标注"）
+                await self._set_claim(frame, claim)
+
+                # 提交前截图
+                try:
+                    await frame.evaluate(
+                        """() => {
+                            const el = document.querySelector('input[placeholder*="标题"], .rich-text-content');
+                            if (el) el.scrollIntoView({ block: 'center' });
+                        }"""
+                    )
+                    await asyncio.sleep(1)
+                    await page.screenshot(
+                        path=str(log_dir / "guanghe_image_before_submit_top.png"),
+                        full_page=True,
+                    )
+                except Exception:
+                    pass
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "guanghe_image_before_submit.png"),
+                        full_page=True,
+                    )
+                except Exception:
+                    pass
+
+                if dry_run or _DRY_RUN_PUBLISH:
+                    hold_ms = int(_os.environ.get("GUANGHE_DRY_RUN_HOLD_MS", "0") or 0)
+                    logger.info(
+                        "[上传图文] 🐛 DRY_RUN 跳过点击发布（hold=%sms，0 表示一直等窗口关闭）",
+                        hold_ms,
+                    )
+                    try:
+                        await page.wait_for_event("close", timeout=hold_ms)
+                    except Exception:
+                        pass
+                    upload_success = True
+                else:
+                    submitted = await self._click_publish(frame, page)
+                    if submitted:
+                        logger.info("[上传图文] ✓ 发布成功")
+                        try:
+                            await page.screenshot(
+                                path=str(log_dir / "guanghe_image_after_submit.png"),
+                                full_page=True,
+                            )
+                        except Exception:
+                            pass
+                        upload_success = True
+                    else:
+                        logger.info("[上传图文] ✗ 发布失败")
+                        try:
+                            await page.screenshot(
+                                path=str(log_dir / "guanghe_image_submit_failed.png"),
+                                full_page=True,
+                            )
+                        except Exception:
+                            pass
+            finally:
+                if upload_success:
+                    try:
+                        await context.storage_state(path=account_file)
+                        logger.info("[上传图文] cookie 已更新")
+                    except Exception:
+                        pass
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+        finally:
+            try:
+                await self.close_browser(browser, is_close_by_code=True)
+            except Exception:
+                pass
+            logger.info("[上传图文] 浏览器已关闭")
+
+    @staticmethod
+    async def _find_image_publish_frame(page):
+        """找到图文编辑所在的 iframe（gg-picture 交叉域页面）。
+
+        判据：frame 内出现标题输入框 / 富文本描述 / 「立即发布」按钮。
+        """
+        deadline = asyncio.get_event_loop().time() + 25
+        while asyncio.get_event_loop().time() < deadline:
+            raise_if_page_closed(page)
+            for frame in page.frames:
+                if frame == page.main_frame:
+                    continue
+                try:
+                    count = await frame.locator(
+                        'input[placeholder*="标题"], .rich-text-content, '
+                        '.next-btn-primary:has-text("立即发布")'
+                    ).count()
+                    if count > 0:
+                        logger.info(f"[上传图文] ✓ 找到编辑页 frame: {frame.url[:120]}")
+                        return frame
+                except Exception:
+                    pass
+            await asyncio.sleep(1)
+        logger.info("[上传图文] 未找到编辑页 iframe，使用主 frame")
+        return page.main_frame
+
+    @staticmethod
+    async def _find_upload_trigger(frame):
+        """定位右侧真正的上传框。
+
+        页面上有两处「点击上传图片」：左侧手机预览区（点击无反应）和右侧上传框
+        （文案为「点击上传图片 (0/9)」）。取横向位置最右的那个。
+        """
+        candidates = frame.locator("text=点击上传图片")
+        total = await candidates.count()
+        logger.info("[上传图文] 「点击上传图片」候选数: %s", total)
+        best, best_x = None, None
+        for i in range(total):
+            el = candidates.nth(i)
+            try:
+                box = await el.bounding_box()
+            except Exception:
+                box = None
+            if not box:
+                continue
+            logger.info("[上传图文] 候选[%s] x=%.0f y=%.0f", i, box["x"], box["y"])
+            if best_x is None or box["x"] > best_x:
+                best, best_x = el, box["x"]
+        return best
+
+    @staticmethod
+    async def _wait_selector_frame(page, timeout_s: int = 25):
+        """等待素材库选择弹窗 iframe（sucai-selector-ng）出现。"""
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            for f in page.frames:
+                if "sucai-selector-ng" not in (f.url or ""):
+                    continue
+                try:
+                    if await f.locator("text=本地上传").count() > 0:
+                        return f
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+        raise RuntimeError("图片选择弹窗未出现（sucai-selector-ng iframe 缺失）")
+
+    @staticmethod
+    async def _select_folder(selector, folder: str) -> bool:
+        """把素材库左侧导航切到指定文件夹，后续上传即落到该文件夹。"""
+        try:
+            item = selector.get_by_text(folder, exact=True).first
+            await item.wait_for(state="visible", timeout=8000)
+            await item.click(timeout=5000)
+            logger.info("[上传图文] 已切换素材文件夹: %s", folder)
+            await asyncio.sleep(2)
+            return True
+        except Exception as exc:
+            logger.info("[上传图文] 切换素材文件夹失败(%s): %s", folder, str(exc)[:120])
+            return False
+
+    @staticmethod
+    async def _wait_selector_uploaded(selector, before_count: int, timeout_s: int = 180):
+        """等待素材库弹窗内的上传完成：素材图数量增加且不再显示「上传中」。"""
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(2)
+            try:
+                state = await selector.evaluate(
+                    """() => ({
+                        imgs: document.querySelectorAll('img').length,
+                        uploading: ((document.body && document.body.innerText) || '').includes('上传中'),
+                    })"""
+                )
+            except Exception:
+                continue
+            if state.get("imgs", 0) > before_count and not state.get("uploading"):
+                logger.info(
+                    "[上传图文] 素材上传完成（图 %s → %s）",
+                    before_count, state.get("imgs"),
+                )
+                return True
+        logger.info("[上传图文] 等待素材上传超时，继续尝试确认")
+        return False
+
+    @staticmethod
+    async def _js_click(selector, sel, timeout_s: int = 20):
+        """JS 直接派发 click，绕开客服浮窗等遮挡。"""
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            btn = selector.locator(sel).last
+            try:
+                if await btn.count() > 0:
+                    await btn.evaluate("el => el.click()")
+                    return True
+            except Exception as exc:
+                logger.info("[上传图文] JS 点击失败(%s): %s", sel, str(exc)[:80])
+            await asyncio.sleep(0.5)
+        return False
+
+    @staticmethod
+    async def _finish_upload_dialog(selector, timeout_s: int = 60):
+        """上传结果弹窗：点右下角「完成」，回到素材列表。"""
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            done = await TaobaoGuanghePlatform._js_click(
+                selector,
+                'button:has-text("完成"), .next-btn-primary:has-text("完成")',
+                timeout_s=5,
+            )
+            if done:
+                logger.info("[上传图文] 已点击上传结果弹窗的「完成」")
+                for _ in range(15):
+                    await asyncio.sleep(1)
+                    try:
+                        still = await selector.evaluate(
+                            """() => ((document.body && document.body.innerText) || '').includes('上传结果')"""
+                        )
+                    except Exception:
+                        still = False
+                    if not still:
+                        return True
+            await asyncio.sleep(1)
+        logger.info("[上传图文] 上传结果弹窗未关闭")
+        return False
+
+    @staticmethod
+    async def _select_new_images(selector, count: int):
+        """在素材列表里勾选最新上传的几张图（列表按上传时间倒序，最新的在最前）。"""
+        total = await selector.evaluate(
+            """() => {
+            let i = 0;
+            for (const img of document.querySelectorAll('img')) {
+                let p = img.parentElement;
+                for (let k = 0; k < 4 && p; k++, p = p.parentElement) {
+                    const t = (p.innerText || '').replace(/\\s+/g, ' ');
+                    if (t.length < 60 && /\\d+x\\d+/.test(t) && !t.includes('图片要求')) {
+                        p.setAttribute('data-sau-card', String(i++));
+                        break;
+                    }
+                }
+            }
+            return i;
+        }"""
+        )
+        logger.info("[上传图文] 可点击素材卡片数: %s", total)
+
+        for i in range(min(count, int(total or 0))):
+            card = selector.locator(f'[data-sau-card="{i}"]').first
+            try:
+                await card.click(timeout=5000)
+                logger.info("[上传图文] 已点击素材卡片 %s", i)
+            except Exception as exc:
+                logger.info("[上传图文] 素材卡片 %s 点击失败: %s", i, str(exc)[:80])
+            await asyncio.sleep(0.8)
+        await asyncio.sleep(1)
+
+        try:
+            sel_count = await selector.evaluate(
+                """() => document.querySelectorAll('[data-sau-card][class*=select], [class*=selected]').length"""
+            )
+            logger.info("[上传图文] 选中态元素数: %s", sel_count)
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _confirm_selector(selector):
+        """点击素材库弹窗的「确定」，把选中的图片带回编辑器。"""
+        for sel in ('button:has-text("确定")', '.next-btn-primary:has-text("确定")'):
+            if await TaobaoGuanghePlatform._js_click(selector, sel, timeout_s=10):
+                logger.info("[上传图文] 已点击素材弹窗的「确定」")
+                await asyncio.sleep(2)
+                return
+        raise RuntimeError("未找到图片选择弹窗的确定按钮")
+
+    @staticmethod
+    async def _upload_images(page, frame, files: list):
+        """上传图片：点上传框 → 素材库弹窗 → 本地上传 → 确定。"""
+        logger.info("[上传图文] 上传 %d 张图片", len(files))
+
+        trigger = await TaobaoGuanghePlatform._find_upload_trigger(frame)
+        if trigger is None:
+            raise RuntimeError("未找到图片上传入口")
+        await trigger.click()
+        logger.info("[上传图文] 已点击上传框，等待图片选择弹窗")
+
+        selector = await TaobaoGuanghePlatform._wait_selector_frame(page)
+
+        await TaobaoGuanghePlatform._select_folder(selector, _GUANGHE_IMAGE_FOLDER)
+
+        try:
+            before_count = await selector.evaluate("() => document.querySelectorAll('img').length")
+        except Exception:
+            before_count = 0
+        logger.info("[上传图文] 弹窗素材图数量(上传前): %s", before_count)
+
+        local = selector.locator("text=本地上传").first
+        await local.wait_for(state="visible", timeout=15000)
+        async with page.expect_file_chooser(timeout=15000) as chooser_info:
+            await local.click()
+        chooser = await chooser_info.value
+        await chooser.set_files(files)
+        logger.info("[上传图文] 已提交 %d 个文件，等待素材上传", len(files))
+
+        await TaobaoGuanghePlatform._wait_selector_uploaded(selector, before_count)
+
+        await TaobaoGuanghePlatform._finish_upload_dialog(selector)
+        await TaobaoGuanghePlatform._select_new_images(selector, len(files))
+
+        try:
+            state = await selector.evaluate(
+                """() => ({
+                    imgs: document.querySelectorAll('img').length,
+                    text: ((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ').slice(0, 300),
+                })"""
+            )
+            logger.info("[上传图文] 弹窗状态: %s", state)
+        except Exception:
+            pass
+        try:
+            log_dir = Path(BASE_DIR / "logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=str(log_dir / "gh_selector_after_upload.png"), full_page=True)
+        except Exception:
+            pass
+
+        await TaobaoGuanghePlatform._confirm_selector(selector)
+        logger.info("[上传图文] ✓ 已确认图片选择")
+
+    @staticmethod
+    async def _wait_images_uploaded(frame, expected: int, timeout_s: int = 180):
+        """等待图片上传完成：计数达到 expected 且不再显示「上传中」。"""
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        last = -1
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(2)
+            try:
+                state = await frame.evaluate(
+                    """() => {
+                        const text = (document.body && document.body.innerText) || '';
+                        const m = text.match(/\\((\\d+)\\/9\\)/);
+                        return {
+                            count: m ? Number(m[1]) : -1,
+                            uploading: text.includes('上传中'),
+                        };
+                    }"""
+                )
+            except Exception:
+                continue
+            count = state.get('count', -1)
+            if count != last:
+                logger.info("[上传图文] 已上传 %s/%d 张", count, expected)
+                last = count
+            if count >= expected and not state.get('uploading'):
+                logger.info("[上传图文] ✓ 图片上传完成")
+                return
+        raise RuntimeError(
+            f"图片上传超时（已上传 {last if last >= 0 else 0}/{expected} 张）"
+        )
+
+    @staticmethod
+    async def _fill_image_title(frame, title: str):
+        """图文标题（maxlength=30，placeholder 含"标题"）。"""
+        if not title:
+            return
+        title_text = title[:_GUANGHE_MAX_TITLE_LEN]
+        logger.info(f"[填写标题] 标题({len(title_text)}字): {title_text}")
+        try:
+            title_input = frame.locator(
+                'input[placeholder*="标题"], input[maxlength="30"]'
+            ).first
+            await title_input.wait_for(state="visible", timeout=15000)
+            await title_input.click()
+            await title_input.fill("")
+            await title_input.fill(title_text)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.info(f"[填写标题] 失败: {e}")
+
+    @staticmethod
+    async def _fill_image_desc_and_tags(frame, desc: str, tags: list):
+        """图文描述 + 标签（rich-text-content 富文本，≤1000 字符）。
+
+        与视频发布共用输入策略：描述逐字输入；标签逐个输入 #xxx，
+        等 React 监听完成后再按空格激活话题联想。
+        """
+        import re as _re
+
+        parsed_tags = []
+        for t in tags or []:
+            if isinstance(t, str):
+                for s in _re.split(r"[,，#]", t):
+                    s = s.strip().lstrip("#").strip()
+                    if s:
+                        parsed_tags.append(s)
+
+        desc_text = (desc or "").strip()
+        tag_texts = [f"#{t}" for t in parsed_tags]
+        tag_total_len = sum(len(t) + 1 for t in tag_texts)
+        if desc_text:
+            desc_text = desc_text[: max(0, _GUANGHE_MAX_DESC_LEN - tag_total_len - 1)]
+        if not desc_text and not tag_texts:
+            return
+
+        try:
+            editor = frame.locator(
+                '.rich-text-content[contenteditable="true"], '
+                '[data-cangjie-content="true"]'
+            ).first
+            await editor.wait_for(state="visible", timeout=15000)
+            await editor.click()
+            await asyncio.sleep(0.5)
+
+            if desc_text:
+                await editor.press_sequentially(desc_text, delay=50)
+                await asyncio.sleep(0.5)
+                logger.info(f"[填写描述] ✓ 描述已填入({len(desc_text)}字)")
+
+            keyboard = frame.page.keyboard
+            for tag in tag_texts:
+                await keyboard.press(" ")
+                await asyncio.sleep(0.3)
+                await editor.press_sequentially(tag, delay=150)
+                await asyncio.sleep(1)
+                await keyboard.press(" ")
+                await asyncio.sleep(0.5)
+                logger.info(f"[填写描述] ✓ 标签已输入并激活: {tag}")
+
+            logger.info(f"[填写描述] 完成，共 {len(tag_texts)} 个标签")
+        except Exception as e:
+            logger.info(f"[填写描述] 失败: {e}")
 
     async def _upload_single_video(
         self,

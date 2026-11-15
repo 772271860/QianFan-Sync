@@ -177,6 +177,8 @@ def publish_images():
                 'alipay': 12, '支付宝': 12,  # 图集发布
                 'vivo': 16, 'VIVO': 16,
                 'weixin_gzh': 17, '微信公众号': 17,  # 公众号贴图
+                'channels': 2, '视频号': 2,  # 视频号图文
+                'taobao_guanghe': 18, '淘宝光合': 18,  # 淘宝光合图文
             }
             platform_id = platform_map.get(platform_type)
             if not platform_id:
@@ -226,6 +228,11 @@ def publish_images():
                 # 微信公众号图集特有字段(视频发布侧用的 snake_case 此处补 camelCase 读取)
                 gzh_collection_name=config.get('gzhCollectionName', '') or config.get('gzh_collection_name', ''),
                 gzh_claim_source=config.get('gzhClaimSource', '') or config.get('gzh_claim_source', ''),
+                # 淘宝光合图文
+                guanghe_claim=config.get('guangheClaim', ''),
+                guangheLinkType=config.get('guangheLinkType', ''),
+                guangheProducts=config.get('guangheProducts') or [],
+                guangheShops=config.get('guangheShops') or [],
                 dry_run=dry_run,
             )
             if asyncio.iscoroutinefunction(publish_fn):
@@ -396,6 +403,7 @@ def _extract_image_channels_summary(draft_data):
         11: ('weibo', '微博'),
         12: ('alipay', '支付宝'),   # 图集发布
         13: ('toutiao', '今日头条'),
+        18: ('taobao_guanghe', '淘宝光合'),
     }
 
     try:
@@ -474,7 +482,7 @@ def execute_publish():
     platform_name_map = {1: '小红书', 2: '视频号', 3: '抖音', 4: '快手', 5: 'B站',
                          6: '百家号', 7: 'TikTok', 8: 'YouTube', 9: '腾讯视频', 10: '爱奇艺',
                          11: '微博', 12: '支付宝', 13: '今日头条', 14: '知乎', 15: 'CSDN',
-                         16: 'VIVO', 17: '微信公众号'}
+                         16: 'VIVO', 17: '微信公众号', 18: '淘宝光合'}
     platform_label = platform_name_map.get(int(platform_type), str(platform_type))
 
     now = datetime.now().isoformat()
