@@ -1112,34 +1112,90 @@ class TaobaoGuanghePlatform(BasePlatform):
         return False
 
     @staticmethod
-    async def _select_new_images(selector, count: int):
-        """在素材列表里勾选最新上传的几张图（列表按上传时间倒序，最新的在最前）。"""
-        total = await selector.evaluate(
+    async def _select_new_images(selector, files: list):
+        """按 files 顺序在素材列表里勾选刚上传的图片。
+
+        素材卡片显示的文件名即上传时的 uuid 文件名（显示可能被截断成 …）。
+        淘宝页面内部并发上传，素材列表的排序与提交顺序无关，
+        所以必须按文件名逐张定位卡片并按 files 顺序点击——点击顺序即传回编辑器的图片顺序。
+        """
+        cards = await selector.evaluate(
             """() => {
+            const cards = [];
+            const seen = new Set();
             let i = 0;
             for (const img of document.querySelectorAll('img')) {
                 let p = img.parentElement;
                 for (let k = 0; k < 4 && p; k++, p = p.parentElement) {
                     const t = (p.innerText || '').replace(/\\s+/g, ' ');
                     if (t.length < 60 && /\\d+x\\d+/.test(t) && !t.includes('图片要求')) {
-                        p.setAttribute('data-sau-card', String(i++));
+                        if (seen.has(p)) break;
+                        seen.add(p);
+                        p.setAttribute('data-sau-card', String(i));
+                        cards.push({
+                            idx: i,
+                            text: t,
+                            alt: img.getAttribute('alt') || '',
+                            title: img.getAttribute('title') || '',
+                            boxTitle: p.getAttribute('title') || '',
+                        });
+                        i++;
                         break;
                     }
                 }
             }
-            return i;
+            return cards;
         }"""
         )
-        logger.info("[上传图文] 可点击素材卡片数: %s", total)
+        logger.info("[上传图文] 可点击素材卡片数: %s", len(cards))
 
-        for i in range(min(count, int(total or 0))):
-            card = selector.locator(f'[data-sau-card="{i}"]').first
+        hays = [
+            ' '.join(filter(None, [c.get('text', ''), c.get('alt', ''),
+                                   c.get('title', ''), c.get('boxTitle', '')])).lower()
+            for c in cards
+        ]
+        claimed = set()
+        missing = []
+
+        async def _click_card(pos: int, label: str):
+            idx = cards[pos]["idx"]
+            card = selector.locator(f'[data-sau-card="{idx}"]').first
             try:
                 await card.click(timeout=5000)
-                logger.info("[上传图文] 已点击素材卡片 %s", i)
+                logger.info("[上传图文] 已点击素材卡片 %s (%s)", idx, label)
             except Exception as exc:
-                logger.info("[上传图文] 素材卡片 %s 点击失败: %s", i, str(exc)[:80])
+                logger.info("[上传图文] 素材卡片 %s 点击失败: %s", idx, str(exc)[:80])
             await asyncio.sleep(0.8)
+
+        for fi, f in enumerate(files):
+            name = Path(f).name.lower()
+            stem = Path(f).stem.lower()
+            hit = None
+            for key in (name, stem, stem[:13], stem[:8]):
+                if not key:
+                    continue
+                for ci, hay in enumerate(hays):
+                    if ci not in claimed and key in hay:
+                        hit = ci
+                        break
+                if hit is not None:
+                    break
+            if hit is None:
+                missing.append(Path(f).name)
+                continue
+            claimed.add(hit)
+            await _click_card(hit, Path(f).name)
+
+        if claimed:
+            for name in missing:
+                logger.warning(
+                    "[上传图文] 跳过 %s：素材列表未匹配到该文件（可能上传失败）", name
+                )
+        else:
+            # 文件名一个都没匹配上（可能 UI 改版），退回按列表前 N 张勾选的旧行为
+            logger.warning("[上传图文] 按文件名零匹配，回退为按列表前 %d 张勾选", len(files))
+            for i in range(min(len(files), len(cards))):
+                await _click_card(i, "回退")
         await asyncio.sleep(1)
 
         try:
@@ -1192,7 +1248,7 @@ class TaobaoGuanghePlatform(BasePlatform):
         await TaobaoGuanghePlatform._wait_selector_uploaded(selector, before_count)
 
         await TaobaoGuanghePlatform._finish_upload_dialog(selector)
-        await TaobaoGuanghePlatform._select_new_images(selector, len(files))
+        await TaobaoGuanghePlatform._select_new_images(selector, files)
 
         try:
             state = await selector.evaluate(
