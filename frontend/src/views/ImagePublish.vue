@@ -269,10 +269,11 @@
       @confirm="onAccountConfirm"
     />
 
-    <!-- Material Select Dialog -->
+    <!-- Material Select Dialog: 追加场景（image 模式且 targetIndex<0）启用多选，替换单张/封面仍为单选 -->
     <MaterialSelectDialog
       ref="materialSelectDialogRef"
       filter-type="image"
+      :multiple="materialSelectMode === 'image' && materialTargetIndex < 0"
       @select="onMaterialSelected"
     />
 
@@ -678,8 +679,9 @@ function openPreviewDialog() {
 
 function openMaterialLibraryForImage(index) {
   materialSelectMode.value = 'image'
-  materialSelectDialogRef.value?.open()
+  // 先定 target 再 open，保证弹窗的 :multiple prop 读取到正确状态
   materialTargetIndex.value = index
+  materialSelectDialogRef.value?.open()
 }
 
 function openMaterialLibraryForCover() {
@@ -690,8 +692,8 @@ function openMaterialLibraryForCover() {
 const materialTargetIndex = ref(-1)
 const materialSelectMode = ref('image')
 
-function onMaterialSelected(material) {
-  const imageData = {
+function toImageData(material) {
+  return {
     id: material.id,
     name: material.name,
     url: material.url,
@@ -701,15 +703,21 @@ function onMaterialSelected(material) {
     uploading: false,
     progress: 100,
   }
+}
+
+function onMaterialSelected(material) {
+  // multiple 模式下弹窗 emit 的是数组，单选是单对象
+  const list = Array.isArray(material) ? material : [material]
 
   if (materialSelectMode.value === 'cover') {
+    const m = list[0]
     currentEditTarget.value.coverImage = {
-      id: material.id,
-      name: material.name,
-      url: material.url,
-      stored_path: material.stored_path,
-      size: material.size,
-      type: material.type,
+      id: m.id,
+      name: m.name,
+      url: m.url,
+      stored_path: m.stored_path,
+      size: m.size,
+      type: m.type,
     }
     ElMessage.success('封面选择成功')
     return
@@ -718,13 +726,18 @@ function onMaterialSelected(material) {
   const targetIdx = materialTargetIndex.value
   const targetImages = currentEditTarget.value.images
   if (targetIdx >= 0 && targetIdx < targetImages.length) {
-    targetImages[targetIdx] = { ...targetImages[targetIdx], ...imageData }
-  } else {
-    if (targetImages.length < 35) {
-      targetImages.push(imageData)
-    } else {
+    // 替换指定张（多选不会进入该分支，multiple 仅追加场景启用）
+    targetImages[targetIdx] = { ...targetImages[targetIdx], ...toImageData(list[0]) }
+    return
+  }
+
+  // 追加：一次可加入多张，满 35 张停止
+  for (const m of list) {
+    if (targetImages.length >= 35) {
       ElMessage.warning('最多只能上传 35 张图片')
+      break
     }
+    targetImages.push(toImageData(m))
   }
 }
 

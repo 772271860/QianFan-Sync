@@ -75,6 +75,16 @@
         </div>
         <div class="upload-placeholder-name"></div>
       </div>
+
+      <!-- Material library trigger -->
+      <div v-if="images.length < maxCount" class="upload-trigger-wrapper">
+        <div class="upload-trigger" @click="emit('open-material-library', -1)">
+          <el-icon :size="28"><FolderOpened /></el-icon>
+          <span class="upload-text">素材库选择</span>
+          <span class="upload-hint">从已上传素材中挑选</span>
+        </div>
+        <div class="upload-placeholder-name"></div>
+      </div>
     </div>
 
     <!-- Hidden file input -->
