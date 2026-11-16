@@ -27,6 +27,7 @@ from .._utils import (
     parse_schedule_time,
     save_login_result,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("jingmai")
@@ -367,7 +368,8 @@ class JdPlatform(BasePlatform):
         log_dir = Path(BASE_DIR / "logs")
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        browser = await self.create_browser(headless=False)
+        # 京麦(id=19)委托本实现; jd(id=20)未注册,用户设置挂在 19 上
+        browser = await self.create_browser(headless=publish_headless(19))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             try:

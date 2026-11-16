@@ -25,6 +25,7 @@ from conf import BASE_DIR
 
 from .._browser import create_browser_sync, create_context_sync
 from .._utils import clear_input, get_account_name_by_cookie_file, parse_schedule_time, scrape_youtube_profile
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 from .._manual_review import (
     manual_review_enabled,
@@ -419,7 +420,7 @@ class YoutubePlatform(BasePlatform):
         browser = None
         try:
             browser = await self.create_browser(
-                headless=False,
+                headless=publish_headless(self.platform_id),
             )
             context = await self.create_context(browser, storage_state=account_file)
             page = await context.new_page()

@@ -24,6 +24,7 @@ from util._logger import bind_account_name, get_channel_logger
 
 from conf import BASE_DIR
 
+from .._browser_visibility import publish_headless
 from .._browser import create_browser_sync, create_context_sync
 from .._utils import (
     clear_and_type,
@@ -716,7 +717,7 @@ class DayuPlatform(BasePlatform):
     ):
         """Upload a single video to one Dayu account."""
         logger.info("[上传视频] 开始上传视频: %s", file_path)
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             try:

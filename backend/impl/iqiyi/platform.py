@@ -16,6 +16,7 @@ from conf import BASE_DIR
 from util._logger import bind_account_name, get_channel_logger
 from .._browser import create_browser_sync, create_context_sync
 from .._utils import clear_and_type, get_account_name_by_cookie_file, parse_schedule_time, raise_if_page_closed, save_login_result
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("iqiyi")
@@ -493,7 +494,7 @@ class IqiyiPlatform(BasePlatform):
         desc="",
     ):
         """Upload a single video to one iQiyi account."""
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             try:

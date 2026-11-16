@@ -18,6 +18,7 @@ from .._utils import (
     save_login_result,
     scrape_weibo_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 from util._logger import bind_account_name, get_channel_logger
 
@@ -510,7 +511,7 @@ class WeiboPlatform(BasePlatform):
         8. 保存 cookie
         """
         logger.info("[上传图集] 开始上传图集 (%d 张图片)", len(file_path_list))
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(
                 browser,
@@ -904,7 +905,7 @@ class WeiboPlatform(BasePlatform):
         weibo_collection="",
     ):
         """Upload a single video to one Weibo account."""
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(
                 browser,

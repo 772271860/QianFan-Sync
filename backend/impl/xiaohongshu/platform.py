@@ -21,6 +21,7 @@ from .._utils import (
 )
 
 from util._logger import bind_account_name, get_channel_logger
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 from .._risk import RiskControlError, guard as guard_risk
 from .._manual_review import (
@@ -460,6 +461,7 @@ class XiaohongshuPlatform(BasePlatform):
                                 xhs_shoot_location=xhs_shoot_location,
                                 xhs_shoot_date=xhs_shoot_date,
                                 xhs_repost_source=xhs_repost_source,
+                                headless=publish_headless(self.platform_id),
                             )
                         )
                     except Exception as exc:
@@ -589,6 +591,7 @@ class XiaohongshuPlatform(BasePlatform):
                         ai_content=ai_content,
                         is_original=is_original,
                         dry_run=dry_run,
+                        headless=publish_headless(self.platform_id),
                     )
                     if result:
                         success_count += 1
@@ -626,6 +629,7 @@ async def _publish_single_video(
     xhs_shoot_location: str = "",
     xhs_shoot_date: str = "",
     xhs_repost_source: str = "",
+    headless: bool = False,
 ):
     """Upload and publish one video to Xiaohongshu using CloakBrowser.
 
@@ -634,7 +638,7 @@ async def _publish_single_video(
     与其他平台一致地经过 BasePlatform 统一入口。
     """
 
-    browser = await create_browser_fn(headless=False)
+    browser = await create_browser_fn(headless=headless)
     try:
         context = await create_context_fn(browser, storage_state=account_file)
         await context.grant_permissions(["geolocation"])
@@ -693,6 +697,7 @@ async def _publish_single_image(
     ai_content: str = "",
     is_original: bool = False,
     dry_run: bool = True,
+    headless: bool = False,
 ) -> bool:
     """Upload and publish one image set to Xiaohongshu using CloakBrowser.
 
@@ -700,7 +705,7 @@ async def _publish_single_image(
     (XiaohongshuPlatform.publish_image) 传入 ``self.create_browser``，确保
     与其他平台一致地经过 BasePlatform 统一入口。
     """
-    browser = await create_browser_fn(headless=False)
+    browser = await create_browser_fn(headless=headless)
     try:
         context = await create_context_fn(browser, storage_state=account_file)
         await context.grant_permissions(["geolocation"])

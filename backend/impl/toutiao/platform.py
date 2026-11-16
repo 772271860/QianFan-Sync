@@ -36,6 +36,7 @@ from .._utils import (
     save_login_result,
     scrape_toutiao_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("toutiao")
@@ -526,7 +527,7 @@ class ToutiaoPlatform(BasePlatform):
     ):
         """Upload a single video to one Toutiao account."""
         logger.info("[上传视频] 开始上传视频: %s", file_path)
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             try:

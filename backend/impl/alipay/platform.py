@@ -45,6 +45,7 @@ from .._utils import (
     save_login_result,
     scrape_alipay_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("alipay")
@@ -508,7 +509,7 @@ class AlipayPlatform(BasePlatform):
         """一组图片上传到单个账号的完整流程。"""
         logger.info("[上传图集] 开始上传图集 (%d 张图片)", len(file_paths))
         logger.info("[上传图集] 标题: %s", title)
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(
                 browser,
@@ -940,7 +941,7 @@ class AlipayPlatform(BasePlatform):
             schedule_time_str,
             reprint_url,
         )
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(
                 browser,

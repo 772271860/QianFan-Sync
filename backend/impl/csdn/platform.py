@@ -28,6 +28,7 @@ from .._utils import (
     save_login_result,
     scrape_csdn_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("csdn")
@@ -556,7 +557,7 @@ class CsdnPlatform(BasePlatform):
         log_dir = Path(BASE_DIR / "logs")
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             upload_success = False

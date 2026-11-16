@@ -24,6 +24,7 @@ from .._utils import (
     save_login_result,
     scrape_user_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 from util._logger import bind_account_name, get_channel_logger
@@ -405,7 +406,7 @@ class TiktokPlatform(BasePlatform):
         logger.info("[上传视频] === 参数打印完毕 ===")
 
         browser = await self.create_browser(
-            headless=False,
+            headless=publish_headless(self.platform_id),
         )
 
         try:

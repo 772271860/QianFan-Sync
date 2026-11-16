@@ -27,6 +27,7 @@ from .._utils import (
     save_login_result,
     scrape_baijiahao_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("baijiahao")
@@ -504,7 +505,7 @@ class BaijiahaoPlatform(BasePlatform):
         ai_content=False,
     ):
         """Upload a single video to one Baijiahao account."""
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(
                 browser,

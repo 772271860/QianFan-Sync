@@ -27,6 +27,7 @@ from .._utils import (
     save_login_result,
     scrape_user_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 from .._manual_review import (
     manual_review_enabled,
@@ -491,7 +492,7 @@ class KuaishouPlatform(BasePlatform):
     ):
         """Upload image note to one Kuaishou account."""
         logger.info("[上传图集] 开始上传图集 (%d 张图片)", len(file_paths))
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             try:
@@ -747,7 +748,7 @@ class KuaishouPlatform(BasePlatform):
         enable_timer: bool,
         video_format: str = "landscape",
     ):
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         upload_success = False
         try:
             context = await self.create_context(browser, storage_state=cookie_path)

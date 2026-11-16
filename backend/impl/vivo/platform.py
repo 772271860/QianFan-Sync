@@ -30,6 +30,7 @@ from .._utils import (
     save_login_result,
     scrape_vivo_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("vivo")
@@ -408,7 +409,7 @@ class VivoPlatform(BasePlatform):
         让用户观察填写结果。设置环境变量 ``VIVO_DRY_RUN=1`` 启用。
         """
         logger.info("[上传视频] 开始上传视频: %s", file_path)
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             try:

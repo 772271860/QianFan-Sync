@@ -41,6 +41,7 @@ from .._utils import (
     save_login_result,
     scrape_weixin_gzh_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 
 logger = get_channel_logger("weixin_gzh")
@@ -697,7 +698,7 @@ class WeixinGzhPlatform(BasePlatform):
         阶段① 素材上传页 videomsg_edit: 传视频→封面→标题→原创→服务规则→保存并发表
         阶段② 发布编辑页 appmsg_edit_v2(新 tab): 标题/描述→合集→创作来源→发表/定时
         """
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(
                 browser,
@@ -2200,7 +2201,7 @@ class WeixinGzhPlatform(BasePlatform):
         复用 video 的阶段②helpers(标题/描述/合集/创作来源/发表/定时)。
         """
         logger.info("[上传图集] 开始上传图集 (%d 张图片)", len(file_path_list))
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(
                 browser,

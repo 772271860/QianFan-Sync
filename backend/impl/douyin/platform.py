@@ -29,6 +29,7 @@ from .._utils import (
     save_login_result,
     scrape_user_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 from .._risk import guard as guard_risk
 from .._manual_review import (
@@ -541,7 +542,7 @@ class DouyinPlatform(BasePlatform):
     ):
         """Upload a single video to one Douyin account."""
         logger.info("[上传视频] 开始上传视频: %s", file_path)
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(
                 browser, storage_state=account_file
@@ -1279,7 +1280,7 @@ class DouyinPlatform(BasePlatform):
     ):
         """Upload image note to one Douyin account."""
         logger.info("[上传图集] 开始上传图集 (%d 张图片)", len(file_paths))
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             try:

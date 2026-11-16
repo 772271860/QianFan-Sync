@@ -787,6 +787,15 @@ def get_settings():
             defaults['storage'] = {'type': 'local', 's3': {}}
         if 'proxyUrl' not in defaults:
             defaults['proxyUrl'] = ''
+        # publishBrowserVisible：JSON dict（键=平台 id 字符串，值=是否显示发布窗口）
+        if 'publishBrowserVisible' in defaults:
+            try:
+                parsed = json.loads(defaults['publishBrowserVisible'])
+                defaults['publishBrowserVisible'] = parsed if isinstance(parsed, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                defaults['publishBrowserVisible'] = {}
+        else:
+            defaults['publishBrowserVisible'] = {}
 
         return jsonify({"code": 200, "data": defaults})
     except Exception as e:

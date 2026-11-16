@@ -125,6 +125,24 @@
       </div>
     </div>
 
+    <!-- 发布浏览器窗口 -->
+    <div class="settings-card">
+      <h3 class="card-title">
+        <svg class="title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        发布浏览器窗口
+      </h3>
+      <p class="card-desc">
+        各平台执行视频 / 图文发布时，浏览器窗口是否可见。默认关闭 = 后台隐藏发布；开启 = 显示窗口，便于观察发布过程。开启「人工验收」时无论此处如何设置都会显示窗口；账号登录扫码不受影响，始终显示窗口。
+      </p>
+      <div class="visibility-grid">
+        <div v-for="p in platformList" :key="p.key" class="visibility-item">
+          <img v-if="p.logo" :src="p.logo" :alt="p.name" class="visibility-logo" />
+          <span class="visibility-name">{{ p.name }}</span>
+          <el-switch v-model="settings.publishBrowserVisible[p.id]" active-text="显示" inactive-text="隐藏" />
+        </div>
+      </div>
+    </div>
+
     <!-- 渠道黑名单 -->
     <div class="settings-card">
       <div class="card-header">
@@ -506,6 +524,7 @@ const settings = reactive({
   imagePublishMinInterval: 15,
   imagePublishDailyLimit: 20,
   manualReview: 'false',
+  publishBrowserVisible: {},
   storage: {
     type: 'local',
     s3: { endpoint: '', access_key: '', secret_key: '', bucket: '', region: '' },
@@ -571,6 +590,11 @@ const fetchSettings = async () => {
         const mr = res.data.manualReview
         settings.manualReview = (mr === true || String(mr).trim().toLowerCase() === 'true') ? 'true' : 'false'
       }
+      if (res.data.publishBrowserVisible && typeof res.data.publishBrowserVisible === 'object') {
+        settings.publishBrowserVisible = { ...res.data.publishBrowserVisible }
+      } else {
+        settings.publishBrowserVisible = {}
+      }
       if (res.data.storage) {
         settings.storage = { ...settings.storage, ...res.data.storage }
       }
@@ -615,6 +639,7 @@ const handleSave = async () => {
       imagePublishMinInterval: settings.imagePublishMinInterval,
       imagePublishDailyLimit: settings.imagePublishDailyLimit,
       manualReview: settings.manualReview === 'true',
+      publishBrowserVisible: settings.publishBrowserVisible,
       storage: settings.storage,
       feedbackEmail: settings.feedbackEmail,
     })
@@ -876,6 +901,31 @@ onMounted(() => {
     }
 
     .chip-name {
+      font-size: 13px;
+      color: $text-primary;
+    }
+
+    .visibility-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 24px;
+      margin-top: 12px;
+    }
+
+    .visibility-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .visibility-logo {
+      width: 22px;
+      height: 22px;
+      border-radius: 4px;
+      object-fit: contain;
+    }
+
+    .visibility-name {
       font-size: 13px;
       color: $text-primary;
     }

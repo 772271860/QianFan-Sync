@@ -27,6 +27,7 @@ from .._utils import (
     raise_if_page_closed,
     save_login_result,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 from .._risk import RiskControlError, guard as guard_risk
 from . import _link_ops
@@ -862,7 +863,7 @@ class TaobaoGuanghePlatform(BasePlatform):
         log_dir = Path(BASE_DIR / "logs")
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             upload_success = False
@@ -1407,7 +1408,7 @@ class TaobaoGuanghePlatform(BasePlatform):
         log_dir = Path(BASE_DIR / "logs")
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        browser = await self.create_browser(headless=False)
+        browser = await self.create_browser(headless=publish_headless(self.platform_id))
         try:
             context = await self.create_context(browser, storage_state=account_file)
             upload_success = False

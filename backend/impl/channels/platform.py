@@ -30,6 +30,7 @@ from .._utils import (
     save_login_result,
     scrape_tencent_profile,
 )
+from .._browser_visibility import publish_headless
 from ..base_platform import BasePlatform
 from .._risk import guard as guard_risk
 from .._manual_review import (
@@ -2161,9 +2162,9 @@ class ChannelsPlatform(BasePlatform):
                         logger.info("[上传视频] 简介: %s", desc)
                         logger.info("[上传视频] 标签: %s", tags)
 
-                        # 有头模式发布(便于观察);不开 humanize(no_viewport=True 与
+                        # 窗口可见性按平台设置(默认隐藏);不开 humanize(no_viewport=True 与
                         # 拟人化鼠标轨迹冲突,会抛 "Viewport size not available")
-                        browser = await self.create_browser(headless=False)
+                        browser = await self.create_browser(headless=publish_headless(self.platform_id))
                         keep_browser_open = False  # 演练时保留浏览器供人工检查，不计为发布成功
                         try:
                             context = await self.create_context(
@@ -2334,7 +2335,7 @@ class ChannelsPlatform(BasePlatform):
                 cookie_name = Path(cookie_path).name
                 nick = get_account_name_by_cookie_file(cookie_name)
                 with bind_account_name(nick or "-"):
-                    browser = await self.create_browser(headless=False)
+                    browser = await self.create_browser(headless=publish_headless(self.platform_id))
                     context = None
                     keep_browser_open = False
                     try:
