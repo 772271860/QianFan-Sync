@@ -57,6 +57,21 @@ _PUBLISH_SUCCESS_URL_MARK = "/page/workspace/tb"
 _GUANGHE_MAX_TITLE_LEN = 30       # 标题 ≤30 字
 _GUANGHE_MAX_DESC_LEN = 1000      # 描述（含#标签）≤1000 字
 
+
+def _guanghe_editor_text(title: str, desc: str) -> str:
+    """光合作品的主文本 = 富文本编辑器内容（发布 payload 的 title 字段）。
+
+    「加个标题让内容更吸引人」输入框(maxlength=30)实际是 shortTitle，
+    只在作品列表/搜索卡片展示；作品正文展示取编辑器内容。所以标题必须
+    拼进编辑器首行（同快手 full_desc = title\\n\\ndesc 的做法），否则
+    发布出的作品看不到标题。
+    """
+    title = (title or "").strip()
+    desc = (desc or "").strip()
+    if title and desc:
+        return f"{title}\n\n{desc}"
+    return title or desc
+
 # 图文发布页 URL（pub_url 指向 huodong 的 gg-picture 编辑器）
 _GUANGHE_IMAGE_PUBLISH_URL = (
     "https://creator.guanghe.taobao.com/page/pubNew/pic"
@@ -870,7 +885,10 @@ class TaobaoGuanghePlatform(BasePlatform):
                 await self._fill_image_title(frame, title)
 
                 # 4. 描述 + 标签（rich-text-content 富文本，≤1000 字符）
-                await self._fill_image_desc_and_tags(frame, desc, tags)
+                # 编辑器内容 = 标题 + 描述（编辑器才是作品主文本，见 _guanghe_editor_text）
+                await self._fill_image_desc_and_tags(
+                    frame, _guanghe_editor_text(title, desc), tags
+                )
 
                 # 5. 创作者声明（光合必填，未选时默认"内容无需标注"）
                 await self._set_claim(frame, claim)
@@ -1360,7 +1378,10 @@ class TaobaoGuanghePlatform(BasePlatform):
                 await self._fill_title(frame, title)
 
                 # 6. 填写描述 + 标签（cangjie 富文本，≤1000 字符）
-                await self._fill_desc_and_tags(frame, desc, tags)
+                # 编辑器内容 = 标题 + 描述（编辑器才是作品主文本，见 _guanghe_editor_text）
+                await self._fill_desc_and_tags(
+                    frame, _guanghe_editor_text(title, desc), tags
+                )
 
                 # 7. 创作者声明（光合必填，未选时默认"内容无需标注"）
                 await self._set_claim(frame, claim)

@@ -80,9 +80,12 @@ export function useChannelForm(defaults, { props, emit }, { publishFn, validateF
           if (JSON.stringify(cur) !== JSON.stringify(fallback)) {
             diff[key] = Array.isArray(cur) ? [...cur] : { ...cur }
           } else if (overridden) {
-            // 曾被覆盖、现已恢复默认: 显式写回空值,避免旧覆盖值复活
-            // (如取消勾选 bool / 清空数组后,旧 true/数组残留在覆盖里)
-            diff[key] = Array.isArray(cur) ? [] : { ...cur }
+            // 曾被覆盖、现已与默认一致: 写回当前值,让覆盖继续与默认同步。
+            // 数组绝不能写 []——批量设置会把同一份话题同时写进 platformConfig
+            // 和 override,之后 watch 触发时两者相等,写 [] 会把有效话题在
+            // override 里变成"显式空",合并时遮蔽掉渠道默认值,发布就丢话题。
+            // (清空数组的场景 cur=[] 与 fallback 不等,走上面分支,已是 [])
+            diff[key] = Array.isArray(cur) ? [...cur] : { ...cur }
           }
         } else if (cur !== fallback) {
           diff[key] = cur
