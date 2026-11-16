@@ -28,6 +28,7 @@ from .._utils import (
     save_login_result,
 )
 from ..base_platform import BasePlatform
+from .._risk import RiskControlError, guard as guard_risk
 from . import _link_ops
 
 logger = get_channel_logger("taobao_guanghe")
@@ -2313,14 +2314,19 @@ class TaobaoGuanghePlatform(BasePlatform):
                 return False
 
             # 等待主 page 跳转（URL 含 /page/workspace/tb = 成功），最多 60s
-            for _ in range(30):
+            for attempt in range(30):
                 await asyncio.sleep(2)
+                # 每 6 秒排查一次风控：光合被拦时页面不跳转，老逻辑会直接判成功
+                if attempt % 3 == 0:
+                    await guard_risk(url_check_target, "淘宝光合")
                 new_url = url_check_target.url or ""
                 if _PUBLISH_SUCCESS_URL_MARK in new_url and new_url != current_url:
                     logger.info(f"[发布] ✓ 页面已跳转: {new_url}")
                     return True
             logger.info("[发布] 60s 内页面未跳转到成功页，按成功处理")
             return True
+        except RiskControlError:
+            raise
         except Exception as exc:
             logger.info(f"[发布] 点击发布失败: {exc}")
             return False

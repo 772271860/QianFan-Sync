@@ -22,7 +22,9 @@ from .._utils import (
 
 from util._logger import bind_account_name, get_channel_logger
 from ..base_platform import BasePlatform
+from .._risk import RiskControlError, guard as guard_risk
 from .._manual_review import (
+    is_success_url,
     manual_review_enabled,
     pause_after_input,
     wait_for_manual_publish,
@@ -590,6 +592,8 @@ class XiaohongshuPlatform(BasePlatform):
                     )
                     if result:
                         success_count += 1
+                except RiskControlError:
+                    raise
                 except Exception as e:
                     logger.error("[发布图集] 账号 %s 发布失败: %s", cookie_path, e)
 
@@ -773,10 +777,15 @@ async def _publish_single_image(
                     # Wait for page navigation after click（自动提交，默认）
                     current_url = page.url
                     await asyncio.sleep(3)
+                    # 点完发布后先查风控：命中会截图并抛 RiskControlError，
+                    # 避免把它当成"元素没找到"或误判为发布成功
+                    await guard_risk(page, "小红书")
                     new_url = page.url
                     logger.info("[发布] 页面URL变化: %s -> %s", current_url, new_url)
 
-                    if "success" in new_url.lower() or "publish/publish" not in new_url:
+                    # 白名单判定：旧条件是 `or "publish/publish" not in new_url`，
+                    # 页面跳到登录页/错误页时也成立，会把失败判成成功
+                    if is_success_url("xiaohongshu", new_url) or "success" in new_url.lower():
                         logger.info("[发布] 图集发布成功: %s", title)
                     else:
                         logger.error("[发布] 页面未跳转到成功页: %s", new_url)
@@ -788,11 +797,15 @@ async def _publish_single_image(
             await context.storage_state(path=account_file)
             logger.info("[发布] Cookie状态已更新")
             return True
+        except RiskControlError:
+            raise
         except Exception as e:
             logger.error("[发布图集] 图集发布出错: %s", e)
             return False
         finally:
             await context.close()
+    except RiskControlError:
+        raise
     except Exception as e:
         logger.error("[发布图集] 图集发布浏览器错误: %s", e)
         return False

@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from conf import BASE_DIR
 from util._logger import get_channel_logger
 from storage import resolve_material_path
+from impl._risk import RiskControlError
+from impl.settings import read_settings
 
 logger = get_channel_logger("image_publish")
 
@@ -23,11 +25,72 @@ image_publish_bp = Blueprint('image_publish', __name__, url_prefix='/api/image-p
 
 DB_PATH = BASE_DIR / "db" / "database.db"
 
+# 同一账号、同一平台的图文发布频率限制（可在设置页覆盖，0 表示关闭）
+_DEFAULT_MIN_INTERVAL_MIN = 15
+_DEFAULT_DAILY_LIMIT = 20
+
 
 def _get_db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _setting_number(key, default, cast=float):
+    try:
+        value = read_settings().get(key, default)
+        return cast(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _quota_block_reason(conn, account_id, platform) -> str:
+    """同一账号在同一平台的发布频率检查。
+
+    Returns:
+        拦截原因；空字符串表示放行。只统计 status='success' 的记录，
+        失败不占用额度，避免用户重试时被自己的失败记录卡住。
+    """
+    if not account_id:
+        return ""
+
+    daily_limit = _setting_number("imagePublishDailyLimit", _DEFAULT_DAILY_LIMIT, int)
+    if daily_limit > 0:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM publish_details "
+            "WHERE account_id=? AND platform=? AND status='success' "
+            "AND date(created_at)=date('now','localtime')",
+            (account_id, platform),
+        ).fetchone()
+        count = row[0] if row else 0
+        if count >= daily_limit:
+            return (
+                f"该账号今日已发布 {count} 条，达到上限 {daily_limit} 条"
+                f"（可在设置页调整）"
+            )
+
+    min_interval = _setting_number("imagePublishMinInterval", _DEFAULT_MIN_INTERVAL_MIN, float)
+    if min_interval > 0:
+        row = conn.execute(
+            "SELECT created_at FROM publish_details "
+            "WHERE account_id=? AND platform=? AND status='success' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (account_id, platform),
+        ).fetchone()
+        if row and row[0]:
+            try:
+                last = datetime.fromisoformat(str(row[0]))
+            except ValueError:
+                last = None
+            if last is not None:
+                gap = (datetime.now() - last).total_seconds() / 60
+                if gap < min_interval:
+                    return (
+                        f"距上次发布仅 {int(gap)} 分钟，需间隔 {min_interval:g} 分钟，"
+                        f"请约 {int(min_interval - gap) + 1} 分钟后再试"
+                    )
+
+    return ""
 
 
 # ========== 图片上传 ==========
@@ -115,6 +178,14 @@ def publish_images():
 
     try:
         conn = _get_db()
+        block = _quota_block_reason(conn, account_id, platform)
+        if block:
+            conn.close()
+            logger.warning(
+                "[image_publish] 频率拦截 platform=%s account=%s: %s",
+                platform, account_name, block,
+            )
+            return jsonify({"code": 429, "msg": block}), 429
         conn.execute(
             """INSERT OR IGNORE INTO publish_batches
                (id, type, title, description, image_material_ids,
@@ -141,6 +212,7 @@ def publish_images():
 
     # ---------- 实际发布执行（保留原有逻辑） ----------
     success = False
+    risk_blocked = False
     err = ""
     try:
         # 获取图片文件路径（从 materials 表读取 stored_path，再解析本地路径）
@@ -245,6 +317,11 @@ def publish_images():
             err = "无图片或缺平台/cookie 配置，跳过实际发布"
             logger.info(f"[image_publish] {err}")
             success = True
+    except RiskControlError as e:
+        logger.error("[image_publish] 风控拦截: %s", e)
+        err = str(e)
+        risk_blocked = True
+        success = False
     except (Exception, asyncio.CancelledError) as e:
         logger.error(f"发布失败或人工取消: {e}")
         err = str(e)
@@ -255,7 +332,8 @@ def publish_images():
 
     if success:
         return jsonify({"code": 200, "msg": "发布成功", "data": {"batch_id": batch_id, "detail_id": detail_id}})
-    return jsonify({"code": 500, "msg": f"发布失败: {err}"}), 500
+    code = 429 if risk_blocked else 500
+    return jsonify({"code": code, "msg": f"发布失败: {err}"}), code
 
 
 # ========== 草稿管理（已迁移到 /api/v2/drafts，保留兼容接口） ==========

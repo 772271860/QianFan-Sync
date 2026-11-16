@@ -749,6 +749,8 @@ def get_settings():
             "autoSaveInterval": "10",
             "accountCheckMode": "pre-publish",
             "batchTaskInterval": "0",
+            "imagePublishMinInterval": "15",
+            "imagePublishDailyLimit": "20",
             "manualReview": "false",
         }
         defaults.update(settings)
@@ -767,7 +769,8 @@ def get_settings():
                 defaults[key] = defaults[key] in ('true', 'True', '1', True)
         # 转换数值类型
         for key in ['publishInterval', 'maxConcurrent', 'heartbeatInterval',
-                    'autoSaveInterval', 'batchTaskInterval']:
+                    'autoSaveInterval', 'batchTaskInterval',
+                    'imagePublishMinInterval', 'imagePublishDailyLimit']:
             if key in defaults:
                 try:
                     defaults[key] = int(defaults[key])

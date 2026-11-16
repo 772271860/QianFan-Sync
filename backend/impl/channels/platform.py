@@ -31,6 +31,7 @@ from .._utils import (
     scrape_tencent_profile,
 )
 from ..base_platform import BasePlatform
+from .._risk import guard as guard_risk
 from .._manual_review import (
     manual_review_enabled,
     pause_after_input,
@@ -1636,10 +1637,15 @@ async def _submit_image_publish(page, is_draft: bool = False) -> None:
 
     done = set()
     next_list_check = 0.0
+    next_risk_check = 0.0
     try:
         deadline = time.time() + 120
         while time.time() < deadline:
             raise_if_page_closed(page)
+            # 等待发布结果的这段时间里，每隔几秒排查一次风控弹窗
+            if time.time() >= next_risk_check:
+                next_risk_check = time.time() + 5
+                await guard_risk(page, "视频号")
             # 发表成功后可能跳回图文列表
             if _image_publish_finished(page):
                 logger.info("[发布] 图文%s成功(已跳回列表)", "草稿保存" if is_draft else "发布")

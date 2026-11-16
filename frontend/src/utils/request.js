@@ -75,6 +75,9 @@ request.interceptors.response.use(
         case 404:
           ElMessage.error(msg || '请求地址不存在')
           break
+        case 429:
+          ElMessage.warning(msg || '操作过于频繁，请稍后再试')
+          break
         case 500:
           ElMessage.error(msg || '服务器内部错误')
           break

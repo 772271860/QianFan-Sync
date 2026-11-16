@@ -30,6 +30,7 @@ from .._utils import (
     scrape_user_profile,
 )
 from ..base_platform import BasePlatform
+from .._risk import guard as guard_risk
 from .._manual_review import (
     manual_review_enabled,
     pause_after_input,
@@ -1457,6 +1458,8 @@ class DouyinPlatform(BasePlatform):
                                 logger.info("[发布] 图集发布成功! 已在管理页面")
                                 result = True
                             else:
+                                # 没跳成功页：先排查是不是风控拦截（命中会抛 RiskControlError）
+                                await guard_risk(page, "抖音")
                                 logger.warning("[发布] 图集发布可能失败 - 当前URL: %s", current_url)
                                 result = False
                     if manual_review_enabled():

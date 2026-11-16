@@ -95,6 +95,24 @@
       </div>
       <div class="setting-row">
         <div class="setting-info">
+          <span class="setting-label">同一账号图文发布最小间隔（分钟）</span>
+          <span class="setting-desc">同一账号在同一平台两次图文发布之间至少等待的时间，用于避免连续发布触发平台风控。0 表示不限制</span>
+        </div>
+        <div class="setting-control">
+          <el-input-number v-model="settings.imagePublishMinInterval" :min="0" :max="1440" controls-position="right" style="width: 120px" />
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <span class="setting-label">同一账号每日图文发布上限（条）</span>
+          <span class="setting-desc">同一账号在同一平台每天最多成功发布多少条图文，超出后当天不再发布。0 表示不限制</span>
+        </div>
+        <div class="setting-control">
+          <el-input-number v-model="settings.imagePublishDailyLimit" :min="0" :max="100" controls-position="right" style="width: 120px" />
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
           <span class="setting-label">发布提交方式</span>
           <span class="setting-desc">影响 抖音/小红书/视频号/快手/B站/YouTube 视频发布：「自动提交发布」由程序自动点击平台发布按钮（默认）；「人工验收」填写完成后保留浏览器，由你核对并亲自点击平台发布按钮，关闭页面视为取消</span>
         </div>
@@ -485,6 +503,8 @@ const settings = reactive({
   autoSaveInterval: 10,
   accountCheckMode: 'pre-publish',
   batchTaskInterval: 0,
+  imagePublishMinInterval: 15,
+  imagePublishDailyLimit: 20,
   manualReview: 'false',
   storage: {
     type: 'local',
@@ -544,6 +564,8 @@ const fetchSettings = async () => {
       if (res.data.autoSaveInterval !== undefined) settings.autoSaveInterval = res.data.autoSaveInterval
       if (res.data.accountCheckMode !== undefined) settings.accountCheckMode = res.data.accountCheckMode
       if (res.data.batchTaskInterval !== undefined) settings.batchTaskInterval = res.data.batchTaskInterval
+      if (res.data.imagePublishMinInterval !== undefined) settings.imagePublishMinInterval = res.data.imagePublishMinInterval
+      if (res.data.imagePublishDailyLimit !== undefined) settings.imagePublishDailyLimit = res.data.imagePublishDailyLimit
       if (res.data.manualReview !== undefined) {
         // 归一化：兼容历史存过的 'True'/'False'/布尔值，统一为下拉的 'true'/'false'
         const mr = res.data.manualReview
@@ -590,6 +612,8 @@ const handleSave = async () => {
       autoSaveInterval: settings.autoSaveInterval,
       accountCheckMode: settings.accountCheckMode,
       batchTaskInterval: settings.batchTaskInterval,
+      imagePublishMinInterval: settings.imagePublishMinInterval,
+      imagePublishDailyLimit: settings.imagePublishDailyLimit,
       manualReview: settings.manualReview === 'true',
       storage: settings.storage,
       feedbackEmail: settings.feedbackEmail,

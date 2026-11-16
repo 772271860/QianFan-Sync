@@ -6,6 +6,7 @@ Completion requires a user submit gesture AND a platform success signal.
 
 import asyncio
 import logging
+import random
 import sqlite3
 import uuid
 from pathlib import Path
@@ -37,7 +38,11 @@ def manual_review_enabled() -> bool:
 
 
 async def pause_after_input():
-    await asyncio.sleep(INPUT_PAUSE_SECONDS)
+    """字段之间停顿。基准 5 秒，实际在 ±40% 内随机。
+
+    固定间隔会让"标题→简介→标签"的节奏精确到毫秒，是明显的机器特征。
+    """
+    await asyncio.sleep(INPUT_PAUSE_SECONDS * random.uniform(0.6, 1.4))
 
 
 def is_success_url(platform, url):
