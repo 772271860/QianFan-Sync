@@ -742,7 +742,7 @@ export const PLATFORMS = {
         ] },
       { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择时间' },
     ],
-    defaultSettings: { title: '', description: '', guangheClaim: '', guangheLinkType: '', guangheProducts: [], guangheShops: [], scheduleTime: '' },
+    defaultSettings: { title: '', description: '', guangheClaim: '', guangheActivity: '', guangheActivityData: null, guangheLinkType: '', guangheProducts: [], guangheShops: [], scheduleTime: '' },
   },
   JINGMAI: {
     id: 19,

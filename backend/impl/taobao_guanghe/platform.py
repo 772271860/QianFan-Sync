@@ -771,6 +771,8 @@ class TaobaoGuanghePlatform(BasePlatform):
         - ``account_file`` (*list[str]*) — cookie 文件名列表
         - ``desc`` (*str*, 可选) — 描述（含#标签 ≤1000 字符）
         - ``guanghe_claim`` (*str*, 可选) — 创作者声明值
+        - ``guanghe_activity`` (*str*, 可选) — 参与话题活动名（草稿/定时路径）
+        - ``activities`` (*list*, 可选) — 参与话题活动名列表（通用透传键，取第一个）
         - ``dry_run`` (*bool*, 可选) — 演练：填完表单不提交，保留浏览器
         """
         title = kwargs.get("title", "") or ""
@@ -779,6 +781,13 @@ class TaobaoGuanghePlatform(BasePlatform):
         account_files = kwargs.get("account_file", []) or []
         desc = kwargs.get("desc", "") or ""
         claim = kwargs.get("guanghe_claim", "") or ""
+        activity = str(kwargs.get("guanghe_activity") or "").strip()
+        if not activity:
+            for a in (kwargs.get("activities") or []):
+                name = str(a.get("name") if isinstance(a, dict) else a or "").strip()
+                if name:
+                    activity = name
+                    break
         dry_run = bool(kwargs.get("dry_run", False))
 
         if not files:
@@ -820,6 +829,7 @@ class TaobaoGuanghePlatform(BasePlatform):
                         account_file=cookie_path,
                         desc=desc,
                         claim=claim,
+                        activity=activity,
                         dry_run=dry_run,
                     )
 
@@ -842,6 +852,7 @@ class TaobaoGuanghePlatform(BasePlatform):
         account_file: str,
         desc: str = "",
         claim: str = "",
+        activity: str = "",
         dry_run: bool = False,
     ) -> None:
         """上传一组图片并发布图文到一个光合账号。
@@ -892,6 +903,9 @@ class TaobaoGuanghePlatform(BasePlatform):
 
                 # 5. 创作者声明（光合必填，未选时默认"内容无需标注"）
                 await self._set_claim(frame, claim)
+
+                # 5.5 参与话题活动（可选，失败告警跳过不阻塞发布）
+                await self._set_activities(frame, activity)
 
                 # 提交前截图
                 try:
@@ -2150,6 +2164,76 @@ class TaobaoGuanghePlatform(BasePlatform):
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.info(f"[创作者声明] 选择失败（非致命）: {e}")
+
+    @staticmethod
+    async def _set_activities(frame, activity: str):
+        """参与话题活动：点「点击添加话题」→ 弹层搜索 → 按名点选卡片 → 确认提交。
+
+        弹层为「话题选择」对话框（编辑器 iframe 内）：
+        - 搜索框 placeholder 含"关键词"，搜索/重置/确认提交均为 next-btn
+        - 话题卡片带稳定追踪属性 data-autolog="key=topic_item_card&text=可选话题:<名称>"
+        - 弹层数据由 mtop JSONP 预取、搜索为前端过滤（无网络请求）
+        可选项失败一律 warning + 关闭弹层 + 跳过，不阻塞发布。
+        """
+        if not activity:
+            return
+        logger.info(f"[参与话题] 准备参与话题活动: {activity}")
+        try:
+            entry = frame.locator("text=点击添加话题").first
+            await entry.wait_for(state="visible", timeout=10000)
+            await entry.click()
+
+            search_input = frame.locator('input[placeholder*="关键词"]').first
+            await search_input.wait_for(state="visible", timeout=10000)
+            await asyncio.sleep(1)  # 等弹层预取分页
+
+            # 搜索过滤出目标卡片（平台搜索为前端过滤，全名必命中）
+            await search_input.fill(activity)
+            await TaobaoGuanghePlatform._js_click(frame, 'button:has-text("搜索")', timeout_s=5)
+            card = None
+            for _ in range(10):
+                await asyncio.sleep(1)
+                loc = frame.locator(f'[data-autolog*="可选话题:{activity}"]').first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible():
+                        card = loc
+                        break
+                except Exception:
+                    continue
+            if card is None:
+                logger.warning(
+                    "[参与话题] 未在话题弹层中找到「%s」（可能已下线或邀约制），跳过参与",
+                    activity,
+                )
+                await TaobaoGuanghePlatform._js_click(frame, 'button:has-text("取消")', timeout_s=5)
+                return
+
+            await card.click(timeout=5000)
+            await asyncio.sleep(1)
+            await TaobaoGuanghePlatform._js_click(frame, 'button:has-text("确认提交")', timeout_s=8)
+            await asyncio.sleep(1.5)
+
+            # 校验回填（入口区应出现话题名与 替换/删除 操作）
+            try:
+                after = await frame.evaluate(
+                    """() => {
+                    const el = document.querySelector('[class*="topic-v2-root"], [class*="topic-v2"]');
+                    return el ? (el.innerText || '').replace(/\\s+/g, ' ').slice(0, 200) : '';
+                }"""
+                )
+                if activity in after:
+                    logger.info(f"[参与话题] ✓ 已参与话题活动: {activity}")
+                else:
+                    logger.warning(f"[参与话题] 回填校验未见到活动名，当前区域文本: {after[:80]}")
+            except Exception:
+                logger.info(f"[参与话题] ✓ 已点击确认提交: {activity}")
+        except Exception as exc:
+            logger.warning(f"[参与话题] 参与话题活动失败（跳过，不阻塞发布）: {str(exc)[:150]}")
+            # 尽量关掉弹层，避免遮罩挡住后续截图/提交
+            try:
+                await TaobaoGuanghePlatform._js_click(frame, 'button:has-text("取消")', timeout_s=5)
+            except Exception:
+                pass
 
     @staticmethod
     async def _set_schedule_time(page, publish_date):

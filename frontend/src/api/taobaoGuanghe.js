@@ -42,4 +42,10 @@ export const guangheApi = {
   pickerClose(sessionId) {
     return http.post('/api/taobao_guanghe/picker/close', { session_id: sessionId })
   },
+
+  // 获取可参与的官方话题活动列表(浏览器 DOM 抓取，后端带 5 分钟 TTL 缓存)
+  // 返回: { data: { list: [{name, category}], total } }
+  getActivityList(accountId) {
+    return http.get(`/api/taobao_guanghe/activities?account_id=${accountId}`)
+  },
 }

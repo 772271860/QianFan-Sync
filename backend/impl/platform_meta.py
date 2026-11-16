@@ -308,6 +308,8 @@ PLATFORM_META: dict[str, dict] = {
         "fields": [
             {"key": "guangheClaim", "label": "创作者声明", "type": "select", "required": True, "options": _opt(
                 "内容无需标注", "含AI生成内容", "含虚构演绎内容", "内容为转载", "个人观点，仅供参考", "内容含营销信息")},
+            {"key": "guangheActivity", "label": "参与话题活动", "type": "select",
+             "note": "官方征稿话题名（单选），数据源接口 /api/taobao_guanghe/activities"},
             {"key": "guangheLinkType", "label": "关联类型", "type": "select", "options": _opt("商品", "店铺")},
             {"key": "guangheProducts", "label": "关联商品", "type": "multiSelect",
              "placeholder": "[{title, image}]，按名称在光合面板搜索匹配"},

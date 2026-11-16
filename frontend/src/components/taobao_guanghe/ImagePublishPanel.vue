@@ -29,6 +29,21 @@
         <el-option v-for="opt in claimOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
       </el-select>
     </div>
+
+    <div class="setting-card" style="grid-column: 1 / -1">
+      <div class="setting-label">参与话题活动</div>
+      <div class="setting-hint">由官方发起的征稿话题，参与有机会获得额外流量奖励（可选）</div>
+      <RemoteSearchSelect
+        v-model="form.guangheActivity"
+        :data="form.guangheActivityData"
+        :fetcher="fetchActivities"
+        :field-map="{ label: 'name', desc: 'category' }"
+        search-mode="frontend"
+        empty-behavior="load-all"
+        placeholder="选择话题活动（可搜索）"
+        @change="handleActivityChange"
+      />
+    </div>
   </div>
 </template>
 
@@ -37,9 +52,11 @@ import { ref, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useAccountStore } from '@/stores/account'
 import { imagePublishApi } from '@/api/imagePublish'
+import { guangheApi } from '@/api/taobaoGuanghe'
 import { PLATFORMS } from '@/config/platforms'
 import { useChannelForm } from '@/composables/useChannelForm'
 import { useAutoExtractHashtags } from '@/utils/hashtag'
+import RemoteSearchSelect from '@/components/common/RemoteSearchSelect.vue'
 
 const props = defineProps({
   accountId: { type: [Number, Object], default: null },
@@ -59,6 +76,8 @@ const GUANGHE_IMAGE_DEFAULTS = {
   description: '',
   tags: [],
   guangheClaim: '内容无需标注',
+  guangheActivity: '',
+  guangheActivityData: null,
 }
 
 const { form, hasAccountOverride, resetOverride, publicApi } = useChannelForm(
@@ -82,6 +101,7 @@ const { form, hasAccountOverride, resetOverride, publicApi } = useChannelForm(
             description: merged.description,
             tags: merged.tags || [],
             guangheClaim: merged.guangheClaim || '',
+            activities: merged.guangheActivity ? [merged.guangheActivity] : [],
             cover_path: '',
             dry_run: false,
           },
@@ -116,6 +136,22 @@ function addTag() {
 }
 
 function removeTag(index) { form.tags.splice(index, 1) }
+
+// 参与话题活动数据源（后端浏览器抓取 + TTL 缓存）
+async function fetchActivities(keyword) {
+  // 仅点开平台分组未选具体账号时，回退到第一个淘宝光合账号
+  const accId = props.accountId ?? accountStore.accounts.find(a => a.platform === '淘宝光合')?.id
+  const resp = await guangheApi.getActivityList(accId)
+  const all = resp.data?.list || []
+  const kw = keyword?.trim().toLowerCase()
+  return {
+    list: kw ? all.filter(it => it.name?.toLowerCase().includes(kw)) : all,
+  }
+}
+
+function handleActivityChange(topic) {
+  form.guangheActivityData = topic || null
+}
 
 // 自动提取描述中的 #xxx 到标签数组
 useAutoExtractHashtags({

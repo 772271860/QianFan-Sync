@@ -22,6 +22,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from conf import BASE_DIR
 from util._logger import get_channel_logger
+from blueprints._platform_cache import get_cached, set_cached
+from impl.taobao_guanghe.activities import fetch_activities
 from impl.taobao_guanghe.picker import (
     GuanghePickerSession,
     _get_cookie_path_by_account_id,
@@ -83,6 +85,48 @@ def _resolve_session_or_404(session_id: str):
     if session is None:
         return None, _err("会话不存在或已关闭,请重新打开弹窗", 404, 404)
     return session, None
+
+
+# ----------------------------------------------------------------------
+# API: 参与话题活动数据源(全量话题名，浏览器 DOM 抓取 + TTL 缓存)
+# ----------------------------------------------------------------------
+
+@taobao_guanghe_bp.route('/activities', methods=['GET'])
+def get_activities():
+    """获取可参与的官方话题活动列表。
+
+    Query:
+        account_id (str): 账号 id
+
+    Returns:
+        {"code":200,"data":{"list":[{"name","category"}],"total":N}}
+    """
+    account_id = (request.args.get('account_id') or '').strip()
+    if not account_id:
+        return _err("account_id 不能为空", 400, 400)
+
+    cache_key = f"guanghe:activities:{account_id}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return _ok({"list": cached, "total": len(cached)})
+
+    cookie_file = _get_cookie_path_by_account_id(account_id)
+    if not cookie_file:
+        return _err("账号不存在或未登录", 404, 404)
+    cookie_path = _resolve_cookie_path(cookie_file)
+
+    logger.info(f"[话题活动 API] 抓取话题列表 account_id={account_id}")
+    try:
+        topics = run_picker_async(fetch_activities(cookie_path), timeout=180)
+    except Exception as e:
+        logger.error(f"[话题活动 API] 抓取失败: {e}", exc_info=True)
+        return _err(f"获取话题活动列表失败: {e}")
+    if not topics:
+        return _err("未抓取到可参与的话题(可能账号暂无可参与活动)", 502, 502)
+
+    # 只缓存成功结果(skill §3.2)
+    set_cached(cache_key, topics)
+    return _ok({"list": topics, "total": len(topics)})
 
 
 # ----------------------------------------------------------------------
