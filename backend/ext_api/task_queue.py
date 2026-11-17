@@ -509,7 +509,9 @@ class TaskQueue:
             cancelled_by_user = False
             try:
                 result = await self._execute(task)
-                if result is False:
+                # 注意用 not 而非 `is False`：平台层 worker 可能隐式返回 None，
+                # None/False 都不算确认发布成功
+                if not result:
                     raise RuntimeError('平台未确认发布成功，请检查平台页面和日志')
                 task.status = TaskStatus.SUCCESS
             except asyncio.CancelledError:

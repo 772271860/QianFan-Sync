@@ -564,6 +564,7 @@ class XiaohongshuPlatform(BasePlatform):
 
         success_count = 0
         total = len(account_paths)
+        last_error: Exception | None = None
         for index, cookie_path in enumerate(account_paths):
             cookie_name = Path(cookie_path).name
             nick = get_account_name_by_cookie_file(cookie_name)
@@ -598,13 +599,19 @@ class XiaohongshuPlatform(BasePlatform):
                 except RiskControlError:
                     raise
                 except Exception as e:
+                    last_error = e
                     logger.error("[发布图集] 账号 %s 发布失败: %s", cookie_path, e)
 
         logger.info("[发布图集] 图集发布完成: %d/%d 成功", success_count, total)
         logger.info("=" * 60)
         logger.info("[发布图集] 图集发布流程完成!")
         logger.info("=" * 60)
-        return success_count > 0
+        if success_count == 0:
+            # 全部失败时抛出真实异常（而非返回 False），让任务历史记录到具体原因
+            if last_error is not None:
+                raise last_error
+            return False
+        return True
 
 
 # ======================================================================

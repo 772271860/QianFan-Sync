@@ -1230,34 +1230,38 @@ class DouyinPlatform(BasePlatform):
         desc, tags = self._collect_topics(desc, tags, activities)
         logger.info("[话题] 合并后共 %d 个: %s", len(tags), tags)
 
+        results = []
         for cookie_index, cookie_path in enumerate(account_paths):
             cookie_name = Path(cookie_path).name
             nick = get_account_name_by_cookie_file(cookie_name)
             with bind_account_name(nick or "-"):
                 logger.info("[发布进度] 发布到第 %d/%d 个账号 (%s)", cookie_index + 1, len(account_paths), nick or "未知")
-                await self._upload_image_note(
-                    title=title,
-                    file_paths=file_paths,
-                    tags=tags,
-                    account_file=cookie_path,
-                    desc=desc,
-                    cover_path=cover_path,
-                    mix_id=mix_id,
-                    music_name=music_name,
-                    hotspot=hotspot,
-                    tag_type=tag_type,
-                    tag_value=tag_value,
-                    mini_link=mini_link,
-                    enable_timer=enable_timer,
-                    schedule_time_str=schedule_time_str,
-                    ai_content=ai_content,
-                    dry_run=dry_run,
+                results.append(
+                    await self._upload_image_note(
+                        title=title,
+                        file_paths=file_paths,
+                        tags=tags,
+                        account_file=cookie_path,
+                        desc=desc,
+                        cover_path=cover_path,
+                        mix_id=mix_id,
+                        music_name=music_name,
+                        hotspot=hotspot,
+                        tag_type=tag_type,
+                        tag_value=tag_value,
+                        mini_link=mini_link,
+                        enable_timer=enable_timer,
+                        schedule_time_str=schedule_time_str,
+                        ai_content=ai_content,
+                        dry_run=dry_run,
+                    )
                 )
 
         logger.info("=" * 60)
         logger.info("[发布图集] 图集发布流程完成!")
         logger.info("=" * 60)
-        return True
+        # 任一账号失败都如实上报 False（多账号时全成才算成）
+        return all(results) if results else False
 
     async def _upload_image_note(
         self,
@@ -1337,7 +1341,10 @@ class DouyinPlatform(BasePlatform):
                         break
                     await asyncio.sleep(3)
                 else:
-                    logger.warning("[上传图集] 等待图片上传超时. 已上传: %d/%d", uploaded_count, len(file_paths))
+                    # 上传没完成就点发布必然失败，直接中止并如实上报
+                    raise RuntimeError(
+                        f"图片上传超时({max_upload_wait}s)，仅上传 {uploaded_count}/{len(file_paths)} 张，中止发布"
+                    )
 
                 await asyncio.sleep(5)  # 等待更长时间确保页面加载完成
 
@@ -1462,6 +1469,17 @@ class DouyinPlatform(BasePlatform):
                                 # 没跳成功页：先排查是不是风控拦截（命中会抛 RiskControlError）
                                 await guard_risk(page, "抖音")
                                 logger.warning("[发布] 图集发布可能失败 - 当前URL: %s", current_url)
+                                # 失败现场截图：隐藏(离屏)模式下无人看现场，靠截图归因
+                                try:
+                                    log_dir = Path(BASE_DIR) / "logs"
+                                    log_dir.mkdir(parents=True, exist_ok=True)
+                                    await page.screenshot(
+                                        path=str(log_dir / "douyin_image_submit_failed.png"),
+                                        full_page=True,
+                                    )
+                                    logger.info("[发布] 失败现场截图: %s", log_dir / "douyin_image_submit_failed.png")
+                                except Exception:
+                                    pass
                                 result = False
                     if manual_review_enabled():
                         result = True
@@ -1498,6 +1516,7 @@ class DouyinPlatform(BasePlatform):
                 await context.close()
         finally:
             await self.close_browser(browser, is_close_by_code=True)
+        return result
 
     # ------------------------------------------------------------------
     # Helper: set image cover

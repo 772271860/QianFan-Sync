@@ -19,6 +19,7 @@ import os
 
 from conf import LOGIN_HEADLESS, LOCAL_CHROME_HEADLESS
 from util._logger import get_channel_logger
+from ._browser_visibility import PUBLISH_HIDDEN
 
 logger = get_channel_logger("browser")
 
@@ -364,11 +365,86 @@ def _install_close_watchdog(browser) -> None:
     browser.close = _safe_close
 
 
-async def _create_patchright_browser(headless: bool, login_mode: bool):
-    """patchright 后端：启动一个 Playwright 补丁版 Chromium。"""
+# 隐藏发布模式（headless=PUBLISH_HIDDEN）的启动参数与窗口摆放：
+# - 真无头易被平台识别（实测抖音图文提交被静默拒绝：点击发布后 60s 页面不跳转），
+#   改为有头窗口移出屏幕——对平台是真实浏览器指纹，对用户基本不可见
+# - 真无头下 --start-maximized 失效且无窗口尺寸，配合 no_viewport=True 页面
+#   视口塌缩到 800×600（实测截图），响应式布局坍缩导致按钮折叠/坐标点击落空
+#   （参见 baijiahao/platform.py 2026-10 实测注释），这里显式给足尺寸
+# - 离屏/被遮挡窗口会被 Chromium 节流（rAF 停摆、定时器降频），三个开关防其
+#   卡住提交流程
+_HIDDEN_LAUNCH_ARGS = [
+    "--window-position=-32000,-32000",
+    "--window-size=1920,1080",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+]
+
+# macOS 实测无视 --window-position/--window-size（窗口被强制 maximized），
+# 必须在每个 page 创建后用 CDP 移动窗口。Cocoa 钳制下无法完全离屏：
+# left=-32000 会被钳到 -(宽-40)，屏幕右缘留 ~40px 残条（实测下限）；
+# height 被钳到屏幕高度（视口高度≈620，与此前有头发布成功的视口一致）。
+_HIDDEN_WINDOW_POS = {"left": -32000, "top": -32000, "width": 1920, "height": 1080}
+
+
+def _apply_hidden_window_placement(browser) -> None:
+    """隐藏模式：包装 browser.new_context/new_page，页面创建后把窗口移出屏幕。
+
+    headed 模式下 Playwright 每个 context 开一个新 OS 窗口，所以必须挂在
+    new_page 之后逐窗口移动（CDP Browser.setWindowBounds）。
+    移动失败仅告警不阻塞发布——窗口可见总比发布中断好。
+    """
+
+    def _wrap_context(ctx):
+        orig_new_page = ctx.new_page
+
+        async def _new_page(*args, **kwargs):
+            page = await orig_new_page(*args, **kwargs)
+            try:
+                cdp = await ctx.new_cdp_session(page)
+                info = await cdp.send("Browser.getWindowForTarget")
+                await cdp.send(
+                    "Browser.setWindowBounds",
+                    {"windowId": info["windowId"], "bounds": {"windowState": "normal"}},
+                )
+                await cdp.send(
+                    "Browser.setWindowBounds",
+                    {"windowId": info["windowId"], "bounds": dict(_HIDDEN_WINDOW_POS)},
+                )
+                logger.info("[浏览器可见性] 发布窗口已移出屏幕 (mode=headed-hidden)")
+            except Exception as e:
+                logger.warning("[浏览器可见性] 离屏移动失败,窗口保持可见: %s", e)
+            return page
+
+        ctx.new_page = _new_page
+        return ctx
+
+    orig_new_context = browser.new_context
+
+    async def _new_context(*args, **kwargs):
+        return _wrap_context(await orig_new_context(*args, **kwargs))
+
+    browser.new_context = _new_context
+
+
+async def _create_patchright_browser(headless: bool | str, login_mode: bool):
+    """patchright 后端：启动一个 Playwright 补丁版 Chromium。
+
+    headless=False 有头显示；headless=PUBLISH_HIDDEN 有头但移出屏幕
+    （发布隐藏模式，对平台是真实浏览器指纹，对用户不可见）。
+    """
     from patchright.async_api import async_playwright
 
     pw = await async_playwright().start()
+    if headless == PUBLISH_HIDDEN:
+        browser = await pw.chromium.launch(headless=False, args=_HIDDEN_LAUNCH_ARGS)
+        _bind_playwright(browser, pw)
+        _apply_hidden_window_placement(browser)
+        logger.info("[patchright] 浏览器已启动 (mode=headed-hidden 离屏有头)")
+        _install_close_watchdog(browser)
+        return browser
+
     browser = await pw.chromium.launch(headless=headless, args=["--start-maximized"])
     _bind_playwright(browser, pw)
     logger.info("[patchright] 浏览器已启动 (headless=%s)", headless)
@@ -378,7 +454,7 @@ async def _create_patchright_browser(headless: bool, login_mode: bool):
 
 
 async def create_browser(
-    headless: bool | None = None,
+    headless: bool | str | None = None,
     login_mode: bool = False,
     humanize: bool = False,
     human_preset: str = "default",
@@ -387,8 +463,11 @@ async def create_browser(
 
     不接 proxy / extra_args —— 历史代理配置已废弃。
 
-    login_mode=True 或 headless=False（有头）时，自动监听浏览器关闭
-    事件：**用户手动**关浏览器会 cancel 当前 asyncio task，使 login/发布
+    headless=PUBLISH_HIDDEN（"hidden"，发布隐藏模式）时按有头启动并把窗口
+    移出屏幕：对平台是真实浏览器指纹，对用户不可见。真无头不再用于发布。
+
+    login_mode=True 或有头（headless=False / "hidden"）时，自动监听浏览器
+    关闭事件：**用户手动**关浏览器会 cancel 当前 asyncio task，使 login/发布
     流程立即终止并返回失败。而发布成功后平台代码主动 browser.close()
     的正常收尾不会误触发（内部已 disarm）。
 
@@ -407,14 +486,18 @@ async def create_browser(
         return await _create_patchright_browser(headless=headless, login_mode=login_mode)
 
     from cloakbrowser import launch_async
+    hidden = headless == PUBLISH_HIDDEN
     browser = await launch_async(
-        headless=headless,
-        args=["--start-maximized"],
+        headless=False if hidden else headless,
+        args=_HIDDEN_LAUNCH_ARGS if hidden else ["--start-maximized"],
         humanize=humanize,
         human_preset=human_preset,
     )
+    if hidden:
+        _apply_hidden_window_placement(browser)
 
-    if login_mode or headless is False:
+    # "hidden" 也是有头窗口，用户手动关闭同样要能终止发布流程
+    if login_mode or headless is not True:
         _install_close_watchdog(browser)
 
     return browser

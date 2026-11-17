@@ -815,6 +815,7 @@ class TaobaoGuanghePlatform(BasePlatform):
             )
             logger.info("=" * 60)
 
+            results = []
             for cookie_index, cookie_path in enumerate(cookie_paths):
                 cookie_name = Path(cookie_path).name
                 nick = get_account_name_by_cookie_file(cookie_name)
@@ -823,23 +824,26 @@ class TaobaoGuanghePlatform(BasePlatform):
                         "[发布图文] 发布到第 %d/%d 个账号 (%s)",
                         cookie_index + 1, len(cookie_paths), nick or "未知",
                     )
-                    await self._upload_single_image(
-                        title=title,
-                        files=files,
-                        tags=tags,
-                        account_file=cookie_path,
-                        desc=desc,
-                        claim=claim,
-                        activity=activity,
-                        dry_run=dry_run,
+                    results.append(
+                        await self._upload_single_image(
+                            title=title,
+                            files=files,
+                            tags=tags,
+                            account_file=cookie_path,
+                            desc=desc,
+                            claim=claim,
+                            activity=activity,
+                            dry_run=dry_run,
+                        )
                     )
 
             logger.info("=" * 60)
             logger.info("[发布图文] 图文发布流程完成!")
             logger.info("=" * 60)
+            # 任一账号失败都如实上报 False（多账号时全成才算成）
+            return all(results) if results else False
 
-        asyncio.run(_run())
-        return True
+        return asyncio.run(_run())
 
     # ------------------------------------------------------------------
     # Internal upload helpers
@@ -980,6 +984,7 @@ class TaobaoGuanghePlatform(BasePlatform):
             except Exception:
                 pass
             logger.info("[上传图文] 浏览器已关闭")
+        return upload_success
 
     @staticmethod
     async def _find_image_publish_frame(page):
@@ -2485,8 +2490,18 @@ class TaobaoGuanghePlatform(BasePlatform):
                 if _PUBLISH_SUCCESS_URL_MARK in new_url and new_url != current_url:
                     logger.info(f"[发布] ✓ 页面已跳转: {new_url}")
                     return True
-            logger.info("[发布] 60s 内页面未跳转到成功页，按成功处理")
-            return True
+            # 60s 未跳转：再确认一次——页面出现成功标记文案才算成功，
+            # 否则如实判失败（老逻辑无条件按成功处理，造成假成功记录）
+            try:
+                body_text = await url_check_target.inner_text("body")
+            except Exception:
+                body_text = ""
+            for mark in ("发布成功", "提交成功", "审核中"):
+                if mark in body_text:
+                    logger.info("[发布] 未跳转但页面出现成功标记「%s」，按成功处理", mark)
+                    return True
+            logger.warning("[发布] 60s 内页面未跳转到成功页且无成功标记，判定发布失败")
+            return False
         except RiskControlError:
             raise
         except Exception as exc:

@@ -209,18 +209,16 @@ class TestHistoryEndpoint(unittest.TestCase):
                 conn.execute("DELETE FROM publish_batches WHERE id = 'b4'")
                 conn.commit()
 
-    def test_history_filters_out_legacy_batches_by_default(self):
-        """默认查询应过滤掉 v0.6.0 旧版本数据(account_configs 不含
-        coverLandscape / videoLandscape 任一新字段且 source 为空)。
+    def test_history_returns_all_batches_including_legacy_format(self):
+        """默认查询应返回全部批次，包括旧字段格式的数据。
 
-        场景:v0.6.0 时代写入的 batch,detail.account_configs 没有任何
-        v0.7.0 新字段。这些数据应该被默认查询过滤掉,避免用户看到
-        封面破损 / 字段不全的历史卡片。
-
-        通过 ?include_legacy=1 可看全部。
+        历史：曾经默认过滤「account_configs 不含 coverLandscape /
+        videoLandscape 且 source 为空」的 v0.6.0 旧数据，但当前图文
+        发布路径的 account_configs 是 payload 快照（platform/cover_path
+        等键），视频路径写入的 coverLandscape 是 JSON null —— 该过滤
+        把 100% 现代数据都挡掉了，导致发布历史页面空白。现已移除过滤。
         """
-        # 插一条旧版本数据(account_configs 只含 v0.6.0 字段)
-        # 插一条新版本数据(account_configs 含 coverLandscape)
+        # 插一条旧版本格式数据(account_configs 只含 v0.6.0 字段)
         with sqlite3.connect(str(self.DB_PATH)) as conn:
             conn.execute(
                 "INSERT INTO publish_batches (id, type, title, status, account_count, success_count, failed_count, created_at) "
@@ -230,43 +228,23 @@ class TestHistoryEndpoint(unittest.TestCase):
                 "INSERT INTO publish_details (id, batch_id, account_name, platform, account_configs, status) "
                 "VALUES ('d_legacy', 'b_legacy', '账号L', '抖音', ?, 'success')",
                 (json.dumps({
-                    # 只有 v0.6.0 字段,没有 coverLandscape / videoLandscape
+                    # 只有 v0.6.0 字段，没有 coverLandscape / videoLandscape
                     'title': 'legacy', 'description': '', 'tags': [],
                     'thumbnailLandscape': 'x', 'thumbnailPortrait': 'y',
-                }),)
-            )
-            conn.execute(
-                "INSERT INTO publish_batches (id, type, title, status, account_count, success_count, failed_count, created_at) "
-                "VALUES ('b_new', 'video', 'new-batch', 'success', 1, 1, 0, '2026-06-05 10:00:00')"
-            )
-            conn.execute(
-                "INSERT INTO publish_details (id, batch_id, account_name, platform, account_configs, status) "
-                "VALUES ('d_new', 'b_new', '账号N', '抖音', ?, 'success')",
-                (json.dumps({
-                    'title': 'new', 'coverLandscape': {'stored_path': '/x.jpg'},
-                    'videoLandscape': {'stored_path': '/v.mp4'},
                 }),)
             )
             conn.commit()
 
         try:
-            # 默认查询:只看到 new-batch
+            # 默认查询：旧格式批次也应可见
             resp = self.client.get('/api/v2/history?type=video')
             self.assertEqual(resp.status_code, 200)
             ids = [b['id'] for b in resp.get_json()['data']['items']]
-            self.assertIn('b_new', ids)
-            self.assertNotIn('b_legacy', ids, "legacy batch should be filtered by default")
-
-            # include_legacy=1:看到全部
-            resp = self.client.get('/api/v2/history?type=video&include_legacy=1')
-            self.assertEqual(resp.status_code, 200)
-            ids = [b['id'] for b in resp.get_json()['data']['items']]
-            self.assertIn('b_new', ids)
-            self.assertIn('b_legacy', ids, "include_legacy=1 should show all")
+            self.assertIn('b_legacy', ids, "legacy-format batches should be visible by default")
         finally:
             with sqlite3.connect(str(self.DB_PATH)) as conn:
-                conn.execute("DELETE FROM publish_details WHERE id IN ('d_legacy', 'd_new')")
-                conn.execute("DELETE FROM publish_batches WHERE id IN ('b_legacy', 'b_new')")
+                conn.execute("DELETE FROM publish_details WHERE id = 'd_legacy'")
+                conn.execute("DELETE FROM publish_batches WHERE id = 'b_legacy'")
                 conn.commit()
 
 
