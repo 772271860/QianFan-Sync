@@ -50,6 +50,7 @@ frontend.log
 mcp.logdependency/
 dependency*
 /QianFan*/
+/_release/
 *.log
 AGENTS.md
 

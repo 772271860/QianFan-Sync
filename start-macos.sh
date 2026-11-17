@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # ============================================================
-# 一键启动脚本 — Linux + macOS
+# 一键启动脚本 — macOS（自举式：缺 Python/Node/ffmpeg 自动下载便携版）
+# 收件人流程：拿到项目 zip → 解压 → 双击 start.command（或 bash start-macos.sh）
+#   → 首次启动自动下载运行时 + 浏览器内核（走国内镜像）→ 自动打开浏览器
+# 数据（db/cookies/日志）都在项目目录的 data/ 下，删除文件夹即卸载
 # ============================================================
 
 # --- 颜色与符号 ---
@@ -21,14 +24,30 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 BACKEND_DIR="$PROJECT_ROOT/backend"
 FRONTEND_DIR="$PROJECT_ROOT/frontend"
+FRONTEND_DIST="$FRONTEND_DIR/dist"
 MCP_DIR="$PROJECT_ROOT/backend-mcp"
 
 # --- 本地依赖目录（优先使用）---
 DEP_DIR="$PROJECT_ROOT/dependency"
 DEP_BIN_DIR="$DEP_DIR/bin"
-if [[ -d "$DEP_BIN_DIR" ]]; then
-    export PATH="$DEP_BIN_DIR:$DEP_DIR/python/bin:$DEP_DIR/git/bin:$DEP_DIR/node/bin:$PATH"
-fi
+for _d in "$DEP_BIN_DIR" "$DEP_DIR/python/bin" "$DEP_DIR/node/bin"; do
+    [[ -d "$_d" ]] && export PATH="$_d:$PATH"
+done
+unset _d
+
+# --- 浏览器后端与内核位置（默认 patchright，免 license；可用环境变量覆盖）---
+export BROWSER_BACKEND="${BROWSER_BACKEND:-patchright}"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$DEP_DIR/ms-playwright}"
+PW_MIRROR="https://cdn.npmmirror.com/binaries/playwright"
+NODE_OK=0
+MCP_READY=0
+MCP_PID=""
+
+# 清理解压产生的隔离属性（否则 Gatekeeper 会拦下载来的 python/ffmpeg）
+xattr -dr com.apple.quarantine "$PROJECT_ROOT" 2>/dev/null || true
+
+# 清除系统代理，避免 httpx/cloakbrowser 读取到不支持的 socks:// 代理
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 find_cloakbrowser_binary() {
     local base_dir="$1"
@@ -69,6 +88,7 @@ if [[ ! -d "$BACKEND_DIR" ]]; then
     # 首次使用：没有项目代码，从 GitHub 克隆
     if ! command -v git &>/dev/null; then
         echo -e "${CROSS} 未找到 git，无法克隆项目代码"
+        echo -e "  分发 zip 自带完整代码，请确认解压完整（backend/ 目录是否存在）"
         exit 1
     fi
     echo ""
@@ -88,7 +108,7 @@ if [[ ! -d "$BACKEND_DIR" ]]; then
     exec bash "$PROJECT_ROOT/start-macos.sh"
 fi
 
-# 已有项目代码：询问用户是否检查更新（Y=拉取最新代码后启动，N=直接启动）
+# 已有项目代码：询问用户是否检查更新（仅开发者的 git 目录会走到这里；分发 zip 无 .git 自动跳过）
 if command -v git &>/dev/null && [[ -d "$PROJECT_ROOT/.git" ]]; then
     if [[ "${SAU_JUST_UPDATED:-}" == "1" ]]; then
         echo -e "${CHECK} 代码刚已完成更新，跳过更新检查"
@@ -125,7 +145,6 @@ MCP_LOG="$PROJECT_ROOT/mcp.log"
 # --- 后端/前端/MCP 进程 PID ---
 BACKEND_PID=""
 FRONTEND_PID=""
-MCP_PID=""
 
 # --- MCP transport mode（默认 sse 适合后台 daemon；stdio 需父进程喂 stdin）---
 TRANSPORT_MODE="${MCP_TRANSPORT_MODE:-sse}"
@@ -137,13 +156,13 @@ cleanup() {
     if [[ -n "${TAIL_PID:-}" ]] && kill -0 "$TAIL_PID" 2>/dev/null; then
         kill "$TAIL_PID" 2>/dev/null || true
     fi
-    if [[ -n "$MCP_PID" ]] && kill -0 "$MCP_PID" 2>/dev/null; then
-        kill "$MCP_PID" 2>/dev/null || true
-        echo "  MCP 已停止 (PID: $MCP_PID)"
-    fi
     if [[ -n "$FRONTEND_PID" ]] && kill -0 "$FRONTEND_PID" 2>/dev/null; then
         kill "$FRONTEND_PID" 2>/dev/null || true
         echo "  前端已停止 (PID: $FRONTEND_PID)"
+    fi
+    if [[ -n "$MCP_PID" ]] && kill -0 "$MCP_PID" 2>/dev/null; then
+        kill "$MCP_PID" 2>/dev/null || true
+        echo "  MCP 已停止 (PID: $MCP_PID)"
     fi
     if [[ -n "$BACKEND_PID" ]] && kill -0 "$BACKEND_PID" 2>/dev/null; then
         kill "$BACKEND_PID" 2>/dev/null || true
@@ -237,52 +256,11 @@ check_hash_changed() {
 }
 
 # ============================================================
-# Step 1: 检查运行时环境
+# Step 1: 自举运行时（缺什么下载什么，全部落到 dependency/，已有则跳过）
 # ============================================================
-print_step "1" "检查运行时环境"
+print_step "1" "检查并自举运行时"
 
-# --- 检测系统包管理器，用于给出安装提示 ---
-detect_pkg_manager() {
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "brew"
-    elif command -v apt-get &>/dev/null; then
-        echo "apt"
-    elif command -v dnf &>/dev/null; then
-        echo "dnf"
-    elif command -v yum &>/dev/null; then
-        echo "yum"
-    elif command -v pacman &>/dev/null; then
-        echo "pacman"
-    else
-        echo "unknown"
-    fi
-}
-PKG_MGR=$(detect_pkg_manager)
-
-# 根据系统给出安装命令
-install_hint() {
-    local pkg="$1"
-    case "$PKG_MGR" in
-        brew)
-            echo "    安装命令: brew install ${pkg}"
-            ;;
-        apt)
-            echo "    安装命令: sudo apt install ${pkg}"
-            ;;
-        dnf)
-            echo "    安装命令: sudo dnf install ${pkg}"
-            ;;
-        yum)
-            echo "    安装命令: sudo yum install ${pkg}"
-            ;;
-        pacman)
-            echo "    安装命令: sudo pacman -S ${pkg}"
-            ;;
-        *)
-            echo "    请手动安装: ${pkg}"
-            ;;
-    esac
-}
+mkdir -p "$DEP_DIR" "$DEP_BIN_DIR"
 
 # 判断命令来源：内置 (dependency/) 还是系统
 cmd_source() {
@@ -295,54 +273,121 @@ cmd_source() {
     fi
 }
 
-if ! command -v python3 &>/dev/null; then
-    print_fail "未找到 python3，请先安装 Python 3.8+"
-    install_hint "python3 python3-venv python3-pip"
-    exit 1
-fi
-PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
-print_ok "Python ${PYTHON_VERSION} ($(cmd_source python3))"
-
-if ! command -v node &>/dev/null; then
-    print_fail "未找到 node，请先安装 Node.js 16+"
-    if [[ "$PKG_MGR" == "brew" ]]; then
-        echo "    安装命令: brew install node"
-    else
-        echo "    安装命令: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install nodejs"
+# 下载到 $2，主 URL 失败自动切换回 URL（$3）
+download_file() {
+    local output="$1" url="$2" fallback="${3:-}"
+    local tmp="$output.part"
+    if curl -fsSL --retry 2 -A "Mozilla/5.0" -o "$tmp" "$url"; then
+        mv "$tmp" "$output"
+        return 0
     fi
-    exit 1
-fi
-NODE_VERSION=$(node --version 2>&1)
+    rm -f "$tmp"
+    if [[ -n "$fallback" ]]; then
+        if curl -fsSL --retry 2 -A "Mozilla/5.0" -o "$tmp" "$fallback"; then
+            mv "$tmp" "$output"
+            return 0
+        fi
+    fi
+    rm -f "$tmp"
+    return 1
+}
 
-if ! command -v npm &>/dev/null; then
-    print_fail "未找到 npm，请重新安装 Node.js"
-    exit 1
-fi
-NPM_VERSION=$(npm --version 2>&1)
-print_ok "Node ${NODE_VERSION} / npm ${NPM_VERSION} ($(cmd_source node))"
+ensure_python() {
+    if command -v python3 &>/dev/null; then
+        print_ok "Python $(python3 --version 2>&1 | awk '{print $2}') ($(cmd_source python3))"
+        return 0
+    fi
+    print_warn "未找到系统 python3，下载便携版（约 30MB，仅首次）..."
+    local pbs_arch url1 url2 tmp_tar
+    case "$(uname -m)" in
+        arm64)  pbs_arch="aarch64" ;;
+        x86_64) pbs_arch="x86_64" ;;
+        *) print_fail "不支持的 CPU 架构: $(uname -m)"; exit 1 ;;
+    esac
+    url1="https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.12.13+20260414-${pbs_arch}-apple-darwin-install_only.tar.gz"
+    url2="https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.12.13+20260414-${pbs_arch}-apple-darwin-install_only.tar.gz"
+    tmp_tar="$(mktemp -d)/python.tar.gz"
+    if run_with_spinner "下载便携 Python 3.12" bash -c "curl -fsSL --retry 2 -A 'Mozilla/5.0' -o '$tmp_tar' '$url1' || curl -fsSL --retry 2 -A 'Mozilla/5.0' -o '$tmp_tar' '$url2'"; then
+        tar -xzf "$tmp_tar" -C "$DEP_DIR"   # install_only 包顶层目录就是 python/
+        export PATH="$DEP_DIR/python/bin:$PATH"
+        print_ok "Python 内置 $(python3 --version 2>&1 | awk '{print $2}')"
+    else
+        print_fail "Python 下载失败（Python 为必需项）。请检查网络后重试"
+        exit 1
+    fi
+}
 
-if ! command -v curl &>/dev/null; then
-    print_fail "未找到 curl"
-    install_hint "curl"
-    exit 1
-fi
-print_ok "curl $(curl --version 2>&1 | head -1 | awk '{print $2}') ($(cmd_source curl))"
+ensure_node() {
+    if command -v node &>/dev/null; then
+        print_ok "Node $(node --version 2>&1) ($(cmd_source node))"
+        NODE_OK=1
+        return 0
+    fi
+    print_warn "未找到 node，下载便携版（MCP/AI 服务需要，约 25MB，仅首次）..."
+    local narch url1 url2 tmp_tar
+    case "$(uname -m)" in
+        arm64)  narch="arm64" ;;
+        x86_64) narch="x64" ;;
+        *) NODE_OK=0; print_warn "不支持的架构，跳过 Node 下载"; return 1 ;;
+    esac
+    url1="https://cdn.npmmirror.com/binaries/node/v22.16.0/node-v22.16.0-darwin-${narch}.tar.gz"
+    url2="https://nodejs.org/dist/v22.16.0/node-v22.16.0-darwin-${narch}.tar.gz"
+    mkdir -p "$DEP_DIR/node"
+    tmp_tar="$(mktemp -d)/node.tar.gz"
+    if run_with_spinner "下载便携 Node.js v22" bash -c "curl -fsSL --retry 2 -A 'Mozilla/5.0' -o '$tmp_tar' '$url1' || curl -fsSL --retry 2 -A 'Mozilla/5.0' -o '$tmp_tar' '$url2'"; then
+        tar -xzf "$tmp_tar" -C "$DEP_DIR/node" --strip-components=1
+        ln -sf "$DEP_DIR/node/bin/node" "$DEP_BIN_DIR/node"
+        ln -sf "$DEP_DIR/node/bin/npm"  "$DEP_BIN_DIR/npm"
+        ln -sf "$DEP_DIR/node/bin/npx"  "$DEP_BIN_DIR/npx"
+        export PATH="$DEP_BIN_DIR:$DEP_DIR/node/bin:$PATH"
+        NODE_OK=1
+        print_ok "Node 内置 $(node --version 2>&1)"
+    else
+        NODE_OK=0
+        print_warn "Node 下载失败 — MCP/AI 服务将不可用（其余功能正常）"
+    fi
+}
 
-if ! command -v ffmpeg &>/dev/null; then
-    print_fail "未找到 ffmpeg"
-    install_hint "ffmpeg"
-    exit 1
-fi
-print_ok "ffmpeg $(ffmpeg -version 2>&1 | head -1 | awk '{print $3}') ($(cmd_source ffmpeg))"
+ensure_ffmpeg() {
+    if command -v ffmpeg &>/dev/null && command -v ffprobe &>/dev/null; then
+        print_ok "ffmpeg $(ffmpeg -version 2>&1 | head -1 | awk '{print $3}') ($(cmd_source ffmpeg))"
+        return 0
+    fi
+    print_warn "未找到 ffmpeg，下载便携版（视频时长/封面抽帧需要）..."
+    local tmpd f_url1 f_url2 p_url1 p_url2
+    tmpd="$(mktemp -d)"
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        f_url1="https://www.osxexperts.net/ffmpeg902arm.zip";  f_url2="https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip"
+        p_url1="https://www.osxexperts.net/ffprobe902arm.zip"; p_url2="https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip"
+    else
+        f_url1="https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip";  f_url2=""
+        p_url1="https://evermeet.cx/ffmpeg/ffprobe-9.0.2.zip"; p_url2=""
+    fi
+    if ! run_with_spinner "下载 ffmpeg" bash -c "curl -fsSL --retry 2 -A 'Mozilla/5.0' -o '$tmpd/ffmpeg.zip' '$f_url1' || { [[ -n '$f_url2' ]] && curl -fsSL --retry 2 -A 'Mozilla/5.0' -o '$tmpd/ffmpeg.zip' '$f_url2'; }"; then
+        print_warn "ffmpeg 下载失败 — 视频时长/封面抽帧不可用，其余功能正常"
+        return 1
+    fi
+    if ! run_with_spinner "下载 ffprobe" bash -c "curl -fsSL --retry 2 -A 'Mozilla/5.0' -o '$tmpd/ffprobe.zip' '$p_url1' || { [[ -n '$p_url2' ]] && curl -fsSL --retry 2 -A 'Mozilla/5.0' -o '$tmpd/ffprobe.zip' '$p_url2'; }"; then
+        print_warn "ffprobe 下载失败 — 视频时长/封面抽帧不可用，其余功能正常"
+        return 1
+    fi
+    unzip -o -q "$tmpd/ffmpeg.zip" -d "$tmpd"
+    unzip -o -q "$tmpd/ffprobe.zip" -d "$tmpd"
+    if [[ -f "$tmpd/ffmpeg" && -f "$tmpd/ffprobe" ]]; then
+        mv "$tmpd/ffmpeg" "$DEP_BIN_DIR/ffmpeg"
+        mv "$tmpd/ffprobe" "$DEP_BIN_DIR/ffprobe"
+        chmod +x "$DEP_BIN_DIR/ffmpeg" "$DEP_BIN_DIR/ffprobe"
+        export PATH="$DEP_BIN_DIR:$PATH"
+        print_ok "ffmpeg 内置 ($("$DEP_BIN_DIR/ffmpeg" -version 2>&1 | head -1 | awk '{print $3}'))"
+    else
+        print_warn "ffmpeg 解压异常 — 视频时长/封面抽帧不可用，其余功能正常"
+        return 1
+    fi
+}
 
-if ! command -v ffprobe &>/dev/null; then
-    print_fail "未找到 ffprobe，请先安装 ffmpeg（包含 ffprobe）"
-    exit 1
-fi
-print_ok "ffprobe 已安装 ($(cmd_source ffprobe))"
-
-# 清除系统代理，避免 httpx/cloakbrowser 读取到不支持的 socks:// 代理
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+ensure_python
+ensure_node || true
+ensure_ffmpeg || true
 
 # ============================================================
 # Step 2: 处理端口冲突
@@ -352,14 +397,11 @@ print_step "2" "处理端口冲突"
 kill_port 5409
 print_ok "端口 5409 空闲"
 
-kill_port 5173
-print_ok "端口 5173 空闲"
-
 kill_port 5410
 print_ok "端口 5410 空闲"
 
 # ============================================================
-# Step 3: 准备后端环境 (venv)
+# Step 3: 准备后端环境 (venv) + 浏览器内核
 # ============================================================
 print_step "3" "准备后端环境"
 
@@ -374,20 +416,9 @@ if [[ ! -d "$VENV_DIR" ]] || [[ ! -f "$VENV_PIP" ]]; then
     echo -n -e "  ${CYAN}⏳${NC} 创建虚拟环境..."
     rm -rf "$VENV_DIR"
     if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then
-        printf "\r  ${WARN} 虚拟环境创建失败，正在安装 python3-venv...\n"
-        PYTHON_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-        if command -v apt-get &>/dev/null; then
-            sudo apt-get install -y "python${PYTHON_VER}-venv" >/dev/null 2>&1 || {
-                print_fail "安装 python3-venv 失败，请手动执行: sudo apt install python${PYTHON_VER}-venv"
-                exit 1
-            }
-        elif command -v dnf &>/dev/null; then
-            sudo dnf install -y python3-venv >/dev/null 2>&1 || {
-                print_fail "安装 python3-venv 失败，请手动执行: sudo dnf install python3-venv"
-                exit 1
-            }
-        fi
-        python3 -m venv "$VENV_DIR"
+        printf "\r  ${WARN} 虚拟环境创建失败，请检查 python3 是否完整\n"
+        print_fail "venv 创建失败，无法继续"
+        exit 1
     fi
     printf "\r  ${CHECK} 虚拟环境创建完成\n"
     "$VENV_PIP" cache purge >/dev/null 2>&1 || true
@@ -405,117 +436,139 @@ else
     print_ok "依赖无变更，跳过"
 fi
 
-# 检查 CloakBrowser 二进制文件
-CLOAKBROWSER_DIR="$HOME/.cloakbrowser"
-if [[ -n "${CLOAKBROWSER_BINARY_PATH:-}" ]]; then
-    print_ok "CloakBrowser (本地依赖)"
-elif ! _chrome_bin=$(find_cloakbrowser_binary "$CLOAKBROWSER_DIR"); then
-    echo -e "  ${CYAN}📥 首次使用，下载 CloakBrowser 浏览器${NC}"
+# --- 浏览器内核 ---
+if [[ "$BROWSER_BACKEND" == "patchright" ]]; then
+    if compgen -G "$PLAYWRIGHT_BROWSERS_PATH/chromium-*" > /dev/null; then
+        print_ok "patchright Chromium 已就绪"
+    elif run_with_spinner "下载 patchright Chromium（约 250MB，仅首次）" env PLAYWRIGHT_DOWNLOAD_HOST="$PW_MIRROR" "$VENV_PYTHON" -m patchright install chromium chromium-headless-shell; then
+        print_ok "patchright Chromium 就绪"
+    elif run_with_spinner "下载 patchright Chromium（官方源重试）" "$VENV_PYTHON" -m patchright install chromium chromium-headless-shell; then
+        print_ok "patchright Chromium 就绪"
+    else
+        print_fail "Chromium 下载失败（登录/发布必需）。可开启代理后重新运行本脚本"
+        exit 1
+    fi
+elif [[ "$BROWSER_BACKEND" == "cloakbrowser" ]]; then
+    # 检查 CloakBrowser 二进制文件（仅 cloakbrowser 后端模式）
+    CLOAKBROWSER_DIR="$HOME/.cloakbrowser"
+    if [[ -n "${CLOAKBROWSER_BINARY_PATH:-}" ]]; then
+        print_ok "CloakBrowser (本地依赖)"
+    elif ! _chrome_bin=$(find_cloakbrowser_binary "$CLOAKBROWSER_DIR"); then
+        echo -e "  ${CYAN}📥 首次使用，下载 CloakBrowser 浏览器${NC}"
 
-    # 从 Python 获取下载信息
-    DOWNLOAD_INFO=$("$VENV_PYTHON" -c "
+        # 从 Python 获取下载信息
+        DOWNLOAD_INFO=$("$VENV_PYTHON" -c "
 import cloakbrowser.download as d
 print(d.get_fallback_download_url())
 print(d.get_binary_dir())
 print(d.get_binary_path())
 " 2>/dev/null)
 
-    DOWNLOAD_URL=$(echo "$DOWNLOAD_INFO" | sed -n '1p')
-    BINARY_DIR=$(echo "$DOWNLOAD_INFO" | sed -n '2p')
-    BINARY_PATH=$(echo "$DOWNLOAD_INFO" | sed -n '3p')
+        DOWNLOAD_URL=$(echo "$DOWNLOAD_INFO" | sed -n '1p')
+        BINARY_DIR=$(echo "$DOWNLOAD_INFO" | sed -n '2p')
+        BINARY_PATH=$(echo "$DOWNLOAD_INFO" | sed -n '3p')
 
-    if [[ -z "$DOWNLOAD_URL" ]]; then
-        print_fail "无法获取下载地址"
-        exit 1
-    fi
-
-    # 使用 curl 下载（带进度条）
-    # macOS 的 mktemp 不接受模板中有非 X 字符（如 .tar.gz 后缀），
-    # 先建临时目录，文件放在目录里（路径兼容 Linux 和 macOS）。
-    TMP_DIR=$(mktemp -d /tmp/cloakbrowser-XXXXXX)
-    TMP_FILE="$TMP_DIR/cloakbrowser.archive"
-    echo -e "  ${CYAN}⬇  下载地址: ${DOWNLOAD_URL}${NC}"
-    echo ""
-
-    if ! curl -L -# -o "$TMP_FILE" "$DOWNLOAD_URL"; then
-        # 主下载失败，尝试 GitHub 备用地址
-        GITHUB_URL=$(echo "$DOWNLOAD_URL" | sed 's|cloakbrowser.dev|github.com/CloakHQ/cloakbrowser/releases/download|')
-        echo ""
-        echo -e "  ${WARN} 主下载失败，尝试 GitHub 备用地址..."
-        if ! curl -L -# -o "$TMP_FILE" "$GITHUB_URL"; then
-            rm -rf "$TMP_DIR"
-            print_fail "CloakBrowser 下载失败，请检查网络连接"
+        if [[ -z "$DOWNLOAD_URL" ]]; then
+            print_fail "无法获取下载地址"
             exit 1
         fi
-    fi
 
-    # 解压到目标目录
-    echo ""
-    echo -n -e "  ${CYAN}📦 解压中...${NC}"
-    mkdir -p "$BINARY_DIR"
-    if ! tar -xzf "$TMP_FILE" -C "$BINARY_DIR"; then
+        # 使用 curl 下载（带进度条）
+        # macOS 的 mktemp 不接受模板中有非 X 字符（如 .tar.gz 后缀），
+        # 先建临时目录，文件放在目录里（路径兼容 Linux 和 macOS）。
+        TMP_DIR=$(mktemp -d /tmp/cloakbrowser-XXXXXX)
+        TMP_FILE="$TMP_DIR/cloakbrowser.archive"
+        echo -e "  ${CYAN}⬇  下载地址: ${DOWNLOAD_URL}${NC}"
+        echo ""
+
+        if ! curl -L -# -o "$TMP_FILE" "$DOWNLOAD_URL"; then
+            # 主下载失败，尝试 GitHub 备用地址
+            GITHUB_URL=$(echo "$DOWNLOAD_URL" | sed 's|cloakbrowser.dev|github.com/CloakHQ/cloakbrowser/releases/download|')
+            echo ""
+            echo -e "  ${WARN} 主下载失败，尝试 GitHub 备用地址..."
+            if ! curl -L -# -o "$TMP_FILE" "$GITHUB_URL"; then
+                rm -rf "$TMP_DIR"
+                print_fail "CloakBrowser 下载失败，请检查网络连接"
+                exit 1
+            fi
+        fi
+
+        # 解压到目标目录
+        echo ""
+        echo -n -e "  ${CYAN}📦 解压中...${NC}"
+        mkdir -p "$BINARY_DIR"
+        if ! tar -xzf "$TMP_FILE" -C "$BINARY_DIR"; then
+            rm -rf "$TMP_DIR"
+            printf "\r  ${CROSS} CloakBrowser 解压失败\n"
+            exit 1
+        fi
         rm -rf "$TMP_DIR"
-        printf "\r  ${CROSS} CloakBrowser 解压失败\n"
-        exit 1
-    fi
-    rm -rf "$TMP_DIR"
 
-    # 确保实际存在的二进制文件可执行
-    if _chrome_bin=$(find_cloakbrowser_binary "$BINARY_DIR"); then
-        chmod +x "$_chrome_bin" 2>/dev/null || true
-        export CLOAKBROWSER_BINARY_PATH="$_chrome_bin"
-        printf "\r  ${CHECK} CloakBrowser 下载完成\n"
+        # 确保实际存在的二进制文件可执行
+        if _chrome_bin=$(find_cloakbrowser_binary "$BINARY_DIR"); then
+            chmod +x "$_chrome_bin" 2>/dev/null || true
+            export CLOAKBROWSER_BINARY_PATH="$_chrome_bin"
+            printf "\r  ${CHECK} CloakBrowser 下载完成\n"
+        else
+            printf "\r  ${CROSS} CloakBrowser 解压失败\n"
+            print_warn "未找到 CloakBrowser 二进制文件: chrome、chrome-bin/chrome 或 Chromium.app/Contents/MacOS/Chromium"
+            exit 1
+        fi
+        unset _chrome_bin
     else
-        printf "\r  ${CROSS} CloakBrowser 解压失败\n"
-        print_warn "未找到 CloakBrowser 二进制文件: chrome、chrome-bin/chrome 或 Chromium.app/Contents/MacOS/Chromium"
-        exit 1
+        export CLOAKBROWSER_BINARY_PATH="$_chrome_bin"
+        unset _chrome_bin
+        print_ok "CloakBrowser 已安装"
     fi
-    unset _chrome_bin
-else
-    export CLOAKBROWSER_BINARY_PATH="$_chrome_bin"
-    unset _chrome_bin
-    print_ok "CloakBrowser 已安装"
 fi
 
 # ============================================================
-# Step 4: 准备前端环境 (npm)
+# Step 4: 前端 (Flask 托管 dist) + MCP 环境
 # ============================================================
 print_step "4" "准备前端 + MCP 环境"
 
-HASH_FILE="$PROJECT_ROOT/.frontend_deps_hash"
-CURRENT_HASH=$(get_dir_hash "frontend")
-
-if [[ ! -d "$FRONTEND_DIR/node_modules" ]]; then
-    run_with_spinner "安装前端依赖（首次安装，请稍候）" bash -c "cd '$FRONTEND_DIR' && npm install --prefer-offline --registry=https://registry.npmmirror.com 2>&1 | tail -1"
-    echo "$CURRENT_HASH" > "$HASH_FILE"
-    print_ok "前端依赖就绪"
-elif check_hash_changed "$HASH_FILE" "$CURRENT_HASH"; then
-    run_with_spinner "检测到变更，更新前端依赖" bash -c "cd '$FRONTEND_DIR' && npm install --prefer-offline --registry=https://registry.npmmirror.com 2>&1 | tail -1"
-    echo "$CURRENT_HASH" > "$HASH_FILE"
-    print_ok "依赖更新完成"
+# --- 前端：生产模式由后端同端口托管 frontend/dist；分发包自带 dist，缺失才现场构建 ---
+if [[ -f "$FRONTEND_DIST/index.html" ]]; then
+    print_ok "前端 dist 就绪（由后端同端口托管）"
 else
-    print_ok "依赖无变更，跳过"
+    print_warn "未找到 frontend/dist（分发包应自带）— 现场构建（需联网，约 2 分钟）"
+    run_with_spinner "安装前端依赖" bash -c "cd '$FRONTEND_DIR' && npm install --prefer-offline --registry=https://registry.npmmirror.com 2>&1 | tail -1"
+    run_with_spinner "构建前端 dist" bash -c "cd '$FRONTEND_DIR' && npm run build 2>&1 | tail -3"
+    if [[ ! -f "$FRONTEND_DIST/index.html" ]]; then
+        print_fail "前端构建失败，界面不可用，请查看上方输出"
+        exit 1
+    fi
+    print_ok "前端 dist 构建完成"
 fi
 
-# --- MCP: install deps + build ---
-HASH_FILE="$PROJECT_ROOT/.mcp_deps_hash"
-MCP_CURRENT_HASH=$(get_dir_hash "backend-mcp")
+# --- MCP: node_modules 缺失才安装；dist 缺失或代码变更才编译（分发包自带 dist，通常跳过）---
+if [[ "$NODE_OK" == "1" ]]; then
+    HASH_FILE="$PROJECT_ROOT/.mcp_deps_hash"
+    MCP_CURRENT_HASH=$(get_dir_hash "backend-mcp")
 
-if [[ ! -d "$MCP_DIR/node_modules" ]]; then
-    run_with_spinner "安装 MCP 依赖（首次安装，请稍候）" bash -c "cd '$MCP_DIR' && npm install --prefer-offline --registry=https://registry.npmmirror.com 2>&1 | tail -1"
-    echo "$MCP_CURRENT_HASH" > "$HASH_FILE"
-    print_ok "MCP 依赖就绪"
-elif check_hash_changed "$HASH_FILE" "$MCP_CURRENT_HASH"; then
-    run_with_spinner "检测到变更，更新 MCP 依赖" bash -c "cd '$MCP_DIR' && npm install --prefer-offline --registry=https://registry.npmmirror.com 2>&1 | tail -1"
-    echo "$MCP_CURRENT_HASH" > "$HASH_FILE"
-    print_ok "依赖更新完成"
+    if [[ ! -d "$MCP_DIR/node_modules" ]]; then
+        run_with_spinner "安装 MCP 依赖（首次安装，请稍候）" bash -c "cd '$MCP_DIR' && npm install --prefer-offline --registry=https://registry.npmmirror.com 2>&1 | tail -1"
+        echo "$MCP_CURRENT_HASH" > "$HASH_FILE"
+    elif check_hash_changed "$HASH_FILE" "$MCP_CURRENT_HASH"; then
+        run_with_spinner "检测到变更，更新 MCP 依赖" bash -c "cd '$MCP_DIR' && npm install --prefer-offline --registry=https://registry.npmmirror.com 2>&1 | tail -1"
+        echo "$MCP_CURRENT_HASH" > "$HASH_FILE"
+    else
+        print_ok "MCP 依赖无变更，跳过"
+    fi
+
+    if [[ ! -f "$MCP_DIR/dist/index.js" ]] || check_hash_changed "$HASH_FILE" "$MCP_CURRENT_HASH"; then
+        run_with_spinner "编译 MCP (tsc)" bash -c "cd '$MCP_DIR' && npm run build 2>&1 | tail -5"
+    fi
+
+    if [[ -f "$MCP_DIR/dist/index.js" ]]; then
+        MCP_READY=1
+        print_ok "MCP 就绪"
+    else
+        print_warn "MCP 构建产物缺失 — AI Agent 服务不可用（其余功能正常）"
+    fi
 else
-    print_ok "依赖无变更，跳过"
+    print_warn "无 Node.js — 跳过 MCP/AI 服务"
 fi
-
-# 始终重新编译 MCP（保证 dist/ 与 src/ 同步）
-run_with_spinner "编译 MCP (tsc)" bash -c "cd '$MCP_DIR' && npm run build 2>&1 | tail -5"
-print_ok "MCP 编译完成"
 
 # ============================================================
 # Step 5: 启动服务
@@ -536,16 +589,24 @@ nohup "$VENV_PYTHON" app.py > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 print_ok "后端已启动 (PID: $BACKEND_PID)"
 
-cd "$FRONTEND_DIR"
-nohup npm run dev > "$FRONTEND_LOG" 2>&1 &
-FRONTEND_PID=$!
-print_ok "前端已启动 (PID: $FRONTEND_PID)"
+if [[ "$MCP_READY" == "1" ]]; then
+    cd "$MCP_DIR"
+    export TRANSPORT_MODE
+    nohup "$(command -v node)" dist/index.js > "$MCP_LOG" 2>&1 &
+    MCP_PID=$!
+    print_ok "MCP 已启动 (PID: $MCP_PID, transport: $TRANSPORT_MODE)"
+fi
 
-cd "$MCP_DIR"
-export TRANSPORT_MODE
-nohup npm start > "$MCP_LOG" 2>&1 &
-MCP_PID=$!
-print_ok "MCP 已启动 (PID: $MCP_PID, transport: $TRANSPORT_MODE)"
+# 开发者逃生口：SAU_FRONTEND_DEV=1 时保留 vite dev server（5173）
+if [[ "${SAU_FRONTEND_DEV:-0}" == "1" ]]; then
+    if [[ ! -d "$FRONTEND_DIR/node_modules" ]]; then
+        run_with_spinner "安装前端依赖" bash -c "cd '$FRONTEND_DIR' && npm install --prefer-offline --registry=https://registry.npmmirror.com 2>&1 | tail -1"
+    fi
+    cd "$FRONTEND_DIR"
+    nohup npm run dev > "$FRONTEND_LOG" 2>&1 &
+    FRONTEND_PID=$!
+    print_ok "前端 dev server 已启动 (PID: $FRONTEND_PID)"
+fi
 
 cd "$PROJECT_ROOT"
 
@@ -581,63 +642,48 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-echo -n "  等待前端就绪"
-for i in $(seq 1 30); do
-    # Vite 在 macOS 上可能只监听 localhost 的 IPv6 地址（::1），不监听 127.0.0.1。
-    # 使用 --noproxy 避免本机代理把 localhost 请求转走导致误判。
-    http_code=$(curl --noproxy '*' -s -o /dev/null -w "%{http_code}" "http://localhost:5173" 2>/dev/null || true)
-    if [[ "$http_code" != "200" ]]; then
-        http_code=$(curl --noproxy '*' -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:5173" 2>/dev/null || true)
-    fi
-    if [[ "$http_code" == "200" ]]; then
-        echo ""
-        print_ok "前端就绪"
-        break
-    fi
-    if [[ $i -eq 30 ]]; then
-        echo ""
-        print_fail "前端启动超时，请查看日志: $FRONTEND_LOG"
-        tail -20 "$FRONTEND_LOG" 2>/dev/null || true
-        exit 1
-    fi
-    echo -n "."
-    sleep 1
-done
-
 # 等待 MCP（stdio 模式只要进程存活就 OK；sse/both 等端口 5410 监听）
-echo -n "  等待 MCP 就绪"
-for i in $(seq 1 15); do
-    if ! kill -0 "$MCP_PID" 2>/dev/null; then
-        echo ""
-        print_fail "MCP 启动失败，请查看日志: $MCP_LOG"
-        tail -20 "$MCP_LOG" 2>/dev/null || true
-        exit 1
-    fi
-    if [[ "$TRANSPORT_MODE" == "sse" || "$TRANSPORT_MODE" == "both" ]]; then
-        if lsof -P -n -ti :5410 >/dev/null 2>&1; then
+if [[ "$MCP_READY" == "1" && -n "$MCP_PID" ]]; then
+    echo -n "  等待 MCP 就绪"
+    for i in $(seq 1 15); do
+        if ! kill -0 "$MCP_PID" 2>/dev/null; then
             echo ""
-            print_ok "MCP 就绪 (SSE 端口 5410)"
+            print_fail "MCP 启动失败，请查看日志: $MCP_LOG"
+            tail -20 "$MCP_LOG" 2>/dev/null || true
+            exit 1
+        fi
+        if [[ "$TRANSPORT_MODE" == "sse" || "$TRANSPORT_MODE" == "both" ]]; then
+            if lsof -P -n -ti :5410 >/dev/null 2>&1; then
+                echo ""
+                print_ok "MCP 就绪 (SSE 端口 5410)"
+                break
+            fi
+        else
+            # stdio 模式进程存活即就绪
+            echo ""
+            print_ok "MCP 就绪 (stdio)"
             break
         fi
-    else
-        # stdio 模式进程存活即就绪
-        echo ""
-        print_ok "MCP 就绪 (stdio)"
-        break
-    fi
-    if [[ $i -eq 15 ]]; then
-        echo ""
-        print_warn "MCP 启动检查超时（15 秒），但进程仍在运行"
-        break
-    fi
-    echo -n "."
-    sleep 1
-done
+        if [[ $i -eq 15 ]]; then
+            echo ""
+            print_warn "MCP 启动检查超时（15 秒），但进程仍在运行"
+            break
+        fi
+        echo -n "."
+        sleep 1
+    done
+fi
 
 echo ""
 echo "============================================"
-echo -e "  ${GREEN}前端界面: http://localhost:5173${NC}"
-echo -e "  ${GREEN}后端 API: http://localhost:${BACKEND_PORT}${NC}"
+if [[ "${SAU_FRONTEND_DEV:-0}" == "1" ]]; then
+    echo -e "  ${GREEN}前端界面(dev): http://localhost:5173${NC}"
+    echo -e "  ${GREEN}后端 API: http://localhost:${BACKEND_PORT}${NC}"
+else
+    echo -e "  ${GREEN}界面入口: http://localhost:${BACKEND_PORT}${NC}"
+    open "http://localhost:${BACKEND_PORT}" 2>/dev/null || true
+    print_ok "已在浏览器打开界面"
+fi
 if [[ "$TRANSPORT_MODE" == "sse" || "$TRANSPORT_MODE" == "both" ]]; then
     echo -e "  ${GREEN}MCP  SSE:  http://localhost:5410/sse${NC}"
 else

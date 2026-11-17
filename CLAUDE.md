@@ -173,11 +173,11 @@ await element.press_sequentially(tag, delay=150)
 
 ## 项目概述
 
-社交媒体自动上传桌面工具，支持 10 个平台：小红书、视频号、抖音、快手、百家号、B站、TikTok、YouTube、腾讯视频、爱奇艺。通过 Tauri 2 打包为 Windows 桌面应用，内嵌 Python 后端和 Vue 前端。
+社交媒体自动上传工具，支持 10 个平台：小红书、视频号、抖音、快手、百家号、B站、TikTok、YouTube、腾讯视频、爱奇艺。分发形态：项目 zip + 一键启动脚本（自举式，收件人零配置）；`desktop/` 下另有 Electron 桌面壳 P0（未启用）。
 
 ## 架构
 
-**三层结构：** Tauri 桌面壳 → Vue 前端 → Flask API → 平台自动化（Playwright + CloakBrowser）
+**结构：** 浏览器（Vue 前端，生产模式由 Flask 托管 `frontend/dist`）→ Flask API → 平台自动化（patchright / CloakBrowser 可切换）
 
 ### 后端 (`backend/`)
 
@@ -205,11 +205,12 @@ await element.press_sequentially(tag, delay=150)
 - **状态管理：** `frontend/src/stores/`（app.js、account.js、user.js）
 - **API 层：** `frontend/src/api/` — 按模块拆分（accounts、drafts、frames、materials、users）
 
-### Tauri 桌面应用 (`src-tauri/`)
+### 启动与分发（自举式脚本）
 
-- Tauri 2 + Rust，`src-tauri/tauri.conf.json` 配置打包资源（Python 后端、前端 dist、CloakBrowser 二进制）
-- `src-tauri/src/lib.rs` — WebView2 检测、数据目录管理、资源同步
-- 目标平台：Windows NSIS 安装包
+- `start-macos.sh` + `start.command`（macOS）、`start.bat`（Windows）— 一键启动：缺 Python/Node/ffmpeg 自动下载便携版到 `dependency/`（国内镜像），首启自动 `patchright install`，前端由 Flask 托管 `frontend/dist`（生产模式，不跑 vite dev）
+- `scripts/pack-release.sh` — 分发者侧打包：产出 `_release/QianFanSync-<版本>.zip`（含 frontend/dist 与 backend-mcp 构建产物）
+- `BROWSER_BACKEND` 默认 patchright（脚本注入）；CloakBrowser 需 `BROWSER_BACKEND=cloakbrowser` 并自行下载
+- `desktop/` — Electron 桌面壳 P0（探索性，未启用；旧文档描述的 Tauri/src-tauri 不存在）
 
 ## 常用命令
 
@@ -236,11 +237,11 @@ cd frontend && npm run dev             # 启动开发服务器 (端口 5173)
 cd frontend && npm run build           # 构建生产版本
 ```
 
-### Tauri 桌面应用
+### 一键启动 / 分发
 
 ```bash
-cd src-tauri && cargo tauri dev        # 开发模式
-cd src-tauri && cargo tauri build      # 构建桌面安装包
+bash start-macos.sh                    # mac 一键启动（自举，收件人同款流程）
+bash scripts/pack-release.sh           # 产出分发 zip 到 _release/
 ```
 
 ## 开发注意事项

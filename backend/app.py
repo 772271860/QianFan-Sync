@@ -183,29 +183,46 @@ from blueprints.jd_bp import bp as jd_bp  # noqa: E402
 app.register_blueprint(jd_bp)
 logger.info("[Startup] jd_picker registered OK")
 
-FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
-logger.info(f"[Startup] Frontend dir: {FRONTEND_DIR} (exists={FRONTEND_DIR.exists()})")
+def _resolve_frontend_dir():
+    """生产模式前端目录：优先 frontend/dist（仓库布局），回退同级 frontend/
+    （Electron 打包布局，resources/frontend 本身就是 dist 内容）。
+    源码目录有 index.html 但没有 assets/，用 assets/ 存在性区分，避免误 serve 源码页。"""
+    base = Path(__file__).parent.parent
+    for candidate in (base / "frontend" / "dist", base / "frontend"):
+        if (candidate / "index.html").exists() and (candidate / "assets").is_dir():
+            return candidate
+    return None
+
+
+FRONTEND_DIR = _resolve_frontend_dir()
+logger.info(f"[Startup] Frontend dir: {FRONTEND_DIR}")
 
 
 @app.route('/')
 def index():
-    if FRONTEND_DIR.exists():
+    if FRONTEND_DIR:
         return send_from_directory(str(FRONTEND_DIR), 'index.html')
     return jsonify({"code": 200, "msg": "API server running"}), 200
 
 
 @app.route('/assets/<path:filename>')
 def custom_static(filename):
+    if not FRONTEND_DIR:
+        return jsonify({"code": 404, "msg": "frontend not built"}), 404
     return send_from_directory(str(FRONTEND_DIR / 'assets'), filename)
 
 
 @app.route('/favicon.ico')
 def favicon():
+    if not FRONTEND_DIR:
+        return jsonify({"code": 404, "msg": "frontend not built"}), 404
     return send_from_directory(str(FRONTEND_DIR), 'favicon.ico')
 
 
 @app.route('/vite.svg')
 def vite_svg():
+    if not FRONTEND_DIR:
+        return jsonify({"code": 404, "msg": "frontend not built"}), 404
     return send_from_directory(str(FRONTEND_DIR), 'vite.svg')
 
 
